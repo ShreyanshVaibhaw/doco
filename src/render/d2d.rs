@@ -271,6 +271,10 @@ impl D2DRenderer {
         self.debug_panel.set_visible(visible);
     }
 
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
     pub fn debug_panel(&self) -> &DebugPerformancePanel {
         &self.debug_panel
     }

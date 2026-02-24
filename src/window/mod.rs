@@ -43,7 +43,8 @@ use crate::{
     app::AppState,
     document::model::{Block, DocumentModel},
     render::d2d::{D2DRenderer, ShellRenderState},
-    theme::Theme,
+    settings::schema::Settings,
+    theme::{Theme, ThemeManager},
     ui::{
         InputEvent as UiInputEvent,
         Point as UiPoint,
@@ -75,6 +76,7 @@ struct WindowState {
     renderer: Option<D2DRenderer>,
     dpi: f32,
     theme: Theme,
+    theme_manager: ThemeManager,
     debug_panel_visible: bool,
     dropped_files: Vec<PathBuf>,
     jump_list: JumpListState,
@@ -91,7 +93,7 @@ struct WindowState {
 }
 
 impl AppWindow {
-    pub fn new(theme: Theme) -> Result<Self> {
+    pub fn new(theme_manager: ThemeManager, settings: Settings) -> Result<Self> {
         unsafe {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
@@ -129,17 +131,25 @@ impl AppWindow {
         let height = rect.bottom - rect.top;
         let x = (unsafe { GetSystemMetrics(SM_CXSCREEN) } - width).max(0) / 2;
         let y = (unsafe { GetSystemMetrics(SM_CYSCREEN) } - height).max(0) / 2;
+        let theme = theme_manager.active();
+        let mut app_state = AppState::default();
+        app_state.settings = settings.clone();
+        app_state.show_toolbar = settings.appearance.show_toolbar;
+        app_state.show_sidebar = settings.appearance.show_sidebar;
+        app_state.show_statusbar = settings.appearance.show_status_bar;
+        app_state.show_tabs = settings.appearance.show_tab_bar;
 
         let state = Box::new(WindowState {
             renderer: None,
             dpi: 96.0,
             theme,
+            theme_manager,
             debug_panel_visible: false,
             dropped_files: Vec::new(),
             jump_list: JumpListState::with_default_tasks(),
             print_state: PrintState::default(),
             startup_files: parse_startup_files_from_cli(),
-            app_state: AppState::default(),
+            app_state,
             tabs: TabsBar::default(),
             sidebar: Sidebar::default(),
             toolbar: Toolbar::default(),
@@ -192,8 +202,8 @@ impl AppWindow {
     }
 }
 
-unsafe fn apply_window_effects(hwnd: HWND) {
-    let dark_mode = windows::core::BOOL(1);
+unsafe fn apply_window_effects(hwnd: HWND, is_dark: bool) {
+    let dark_mode = windows::core::BOOL(if is_dark { 1 } else { 0 });
     let _ = unsafe {
         DwmSetWindowAttribute(
             hwnd,
@@ -301,6 +311,17 @@ fn relayout_shell(state: &mut WindowState, width: f32, height: f32) {
         },
         state.dpi,
     );
+}
+
+fn sync_theme_from_settings(state: &mut WindowState) -> bool {
+    let previous_name = state.theme.name.clone();
+    let previous_is_dark = state.theme.is_dark;
+    let next = state
+        .theme_manager
+        .apply_preference(&state.app_state.settings.appearance.theme);
+    let changed = previous_name != next.name || previous_is_dark != next.is_dark;
+    state.theme = next;
+    changed
 }
 
 fn collect_document_stats(document: &DocumentModel) -> (usize, usize) {
@@ -442,13 +463,14 @@ unsafe extern "system" fn window_proc(
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_CREATE => {
-            unsafe { apply_window_effects(hwnd) };
             unsafe { DragAcceptFiles(hwnd, true) };
 
             let mut client = RECT::default();
             let _ = unsafe { GetClientRect(hwnd, &mut client) };
 
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
+                let _ = sync_theme_from_settings(state);
+                unsafe { apply_window_effects(hwnd, state.theme.is_dark) };
                 let width = (client.right - client.left).max(1) as u32;
                 let height = (client.bottom - client.top).max(1) as u32;
 
@@ -531,6 +553,16 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_SETTINGCHANGE => {
+            if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
+                let changed = sync_theme_from_settings(state);
+                if changed {
+                    if let Some(renderer) = &mut state.renderer {
+                        renderer.set_theme(state.theme.clone());
+                    }
+                    unsafe { apply_window_effects(hwnd, state.theme.is_dark) };
+                    state.app_state.status_text = format!("Theme updated: {}", state.theme.name);
+                }
+            }
             let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             LRESULT(0)
         }

@@ -2,13 +2,26 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
+    mem::size_of,
     sync::Arc,
 };
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use windows::core::Result;
+use windows::{
+    Win32::{
+        Foundation::ERROR_SUCCESS,
+        System::Registry::{
+            HKEY_CURRENT_USER,
+            REG_VALUE_TYPE,
+            RRF_RT_REG_DWORD,
+            RegGetValueW,
+        },
+    },
+    core::{Result, w},
+};
 
+use crate::settings::schema::ThemePreference;
 use crate::ui::Color;
 
 pub mod backgrounds;
@@ -108,6 +121,22 @@ impl ThemeManager {
         }
     }
 
+    pub fn apply_preference(&self, preference: &ThemePreference) -> Theme {
+        match preference {
+            ThemePreference::SystemAuto => {
+                let fallback = if system_prefers_dark_mode() { "Dark" } else { "Light" };
+                let _ = self.set_active(fallback);
+            }
+            ThemePreference::Named(name) => {
+                if !self.set_active(name) {
+                    let fallback = if system_prefers_dark_mode() { "Dark" } else { "Light" };
+                    let _ = self.set_active(fallback);
+                }
+            }
+        }
+        self.active()
+    }
+
     pub fn names(&self) -> Vec<String> {
         let mut names = self.themes.keys().cloned().collect::<Vec<_>>();
         names.sort();
@@ -189,5 +218,28 @@ pub fn built_in_themes() -> Vec<Theme> {
         theme_template("Dracula", true, 0x282A36, 0x343746, 0xBD93F9, 0xF8F8F2),
         theme_template("Gruvbox Dark", true, 0x282828, 0x3C3836, 0xD79921, 0xEBDBB2),
     ]
+}
+
+pub fn system_prefers_dark_mode() -> bool {
+    unsafe {
+        let mut value: u32 = 1;
+        let mut value_type = REG_VALUE_TYPE(0);
+        let mut value_size = size_of::<u32>() as u32;
+        let status = RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            Some(&mut value_type),
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut value_size),
+        );
+
+        if status == ERROR_SUCCESS {
+            value == 0
+        } else {
+            true
+        }
+    }
 }
 

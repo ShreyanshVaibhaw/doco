@@ -96,7 +96,8 @@ impl App {
         startup.finish_settings_load();
         startup.finish_recent_files_load();
 
-        let window = AppWindow::new(themes.active().clone())?;
+        let _ = themes.apply_preference(&settings.appearance.theme);
+        let window = AppWindow::new(themes, settings.clone())?;
 
         let mut state = AppState::default();
         state.settings = settings;
