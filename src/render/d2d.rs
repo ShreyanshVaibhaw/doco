@@ -44,6 +44,7 @@ use crate::{
         Theme,
         backgrounds::{BackgroundKind, BackgroundSettings, PatternStyle, preset_by_id},
     },
+    ui::Rect as UiRect,
 };
 
 const D2DERR_RECREATE_TARGET: HRESULT = HRESULT(0x8899000C_u32 as i32);
@@ -64,6 +65,18 @@ pub struct ShellRenderState {
     pub status_left: String,
     pub status_right: String,
     pub canvas_background: BackgroundSettings,
+    pub canvas_page_rects: Vec<UiRect>,
+    pub canvas_preview_lines: Vec<String>,
+    pub canvas_show_margin_guides: bool,
+    pub canvas_cursor_visible: bool,
+    pub canvas_scrollbar_visible: bool,
+    pub canvas_scrollbar_alpha: f32,
+    pub canvas_viewport_width: f32,
+    pub canvas_viewport_height: f32,
+    pub canvas_content_width: f32,
+    pub canvas_content_height: f32,
+    pub canvas_scroll_x: f32,
+    pub canvas_scroll_y: f32,
 }
 
 pub struct D2DRenderer {
@@ -341,6 +354,7 @@ impl D2DRenderer {
                 self.d2d_context.FillRectangle(&toolbar_rect, &tool_brush);
             }
             self.draw_canvas_background(canvas_rect, &shell.canvas_background)?;
+            self.draw_document_canvas(canvas_rect, shell)?;
             if status_h > 0.0 {
                 self.d2d_context.FillRectangle(&status_rect, &status_brush);
             }
@@ -622,6 +636,236 @@ impl D2DRenderer {
                 self.draw_canvas_background(rect, &resolved)
             }
         }
+    }
+
+    fn draw_document_canvas(&self, canvas_rect: D2D_RECT_F, shell: &ShellRenderState) -> Result<()> {
+        let shadow_color = crate::ui::Color::rgba(
+            self.theme.page_shadow.r,
+            self.theme.page_shadow.g,
+            self.theme.page_shadow.b,
+            if self.theme.is_dark { 0.32 } else { 0.22 },
+        );
+        let shadow_brush = self.create_brush(shadow_color.as_d2d())?;
+        let page_brush = self.create_brush(self.theme.page_bg.as_d2d())?;
+        let border_brush = self.create_brush(self.theme.border_subtle.as_d2d())?;
+        let guide_brush = self.create_brush(
+            crate::ui::Color::rgba(
+                self.theme.border_default.r,
+                self.theme.border_default.g,
+                self.theme.border_default.b,
+                0.28,
+            )
+            .as_d2d(),
+        )?;
+
+        unsafe {
+            let mut drew_preview = false;
+            for page in &shell.canvas_page_rects {
+                let page_rect = D2D_RECT_F {
+                    left: canvas_rect.left + page.x,
+                    top: canvas_rect.top + page.y,
+                    right: canvas_rect.left + page.x + page.width,
+                    bottom: canvas_rect.top + page.y + page.height,
+                };
+
+                if page_rect.bottom < canvas_rect.top
+                    || page_rect.top > canvas_rect.bottom
+                    || page_rect.right < canvas_rect.left
+                    || page_rect.left > canvas_rect.right
+                {
+                    continue;
+                }
+
+                let shadow_rect = D2D_RECT_F {
+                    left: page_rect.left + 4.0,
+                    top: page_rect.top + 4.0,
+                    right: page_rect.right + 4.0,
+                    bottom: page_rect.bottom + 4.0,
+                };
+                self.d2d_context.FillRectangle(&shadow_rect, &shadow_brush);
+                self.d2d_context.FillRectangle(&page_rect, &page_brush);
+                self.d2d_context.DrawRectangle(
+                    &page_rect,
+                    &border_brush,
+                    1.0,
+                    None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                );
+
+                if shell.canvas_show_margin_guides {
+                    let left_margin_x = page_rect.left + page.width * 0.11;
+                    let right_margin_x = page_rect.right - page.width * 0.11;
+                    self.d2d_context.DrawLine(
+                        Vector2 {
+                            X: left_margin_x,
+                            Y: page_rect.top + 18.0,
+                        },
+                        Vector2 {
+                            X: left_margin_x,
+                            Y: page_rect.bottom - 18.0,
+                        },
+                        &guide_brush,
+                        1.0,
+                        None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                    );
+                    self.d2d_context.DrawLine(
+                        Vector2 {
+                            X: right_margin_x,
+                            Y: page_rect.top + 18.0,
+                        },
+                        Vector2 {
+                            X: right_margin_x,
+                            Y: page_rect.bottom - 18.0,
+                        },
+                        &guide_brush,
+                        1.0,
+                        None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                    );
+                }
+
+                if !drew_preview {
+                    self.draw_page_preview_content(page_rect, shell)?;
+                    drew_preview = true;
+                }
+            }
+        }
+
+        self.draw_canvas_scrollbars(canvas_rect, shell)
+    }
+
+    fn draw_page_preview_content(&self, page_rect: D2D_RECT_F, shell: &ShellRenderState) -> Result<()> {
+        let left_pad = 44.0;
+        let top_pad = 46.0;
+        let right_pad = 40.0;
+        let bottom_pad = 34.0;
+        let text_rect = D2D_RECT_F {
+            left: page_rect.left + left_pad,
+            top: page_rect.top + top_pad,
+            right: page_rect.right - right_pad,
+            bottom: page_rect.bottom - bottom_pad,
+        };
+
+        let line_highlight = self.create_brush(
+            crate::ui::Color::rgba(
+                self.theme.selection_bg.r,
+                self.theme.selection_bg.g,
+                self.theme.selection_bg.b,
+                0.16,
+            )
+            .as_d2d(),
+        )?;
+        let selection = self.create_brush(
+            crate::ui::Color::rgba(
+                self.theme.selection_bg.r,
+                self.theme.selection_bg.g,
+                self.theme.selection_bg.b,
+                0.26,
+            )
+            .as_d2d(),
+        )?;
+        unsafe {
+            let current_line = D2D_RECT_F {
+                left: text_rect.left,
+                top: text_rect.top + 2.0,
+                right: text_rect.right,
+                bottom: text_rect.top + 24.0,
+            };
+            self.d2d_context.FillRectangle(&current_line, &line_highlight);
+            let selection_rect = D2D_RECT_F {
+                left: text_rect.left + 2.0,
+                top: text_rect.top + 3.0,
+                right: (text_rect.left + 220.0).min(text_rect.right),
+                bottom: text_rect.top + 22.0,
+            };
+            self.d2d_context.FillRectangle(&selection_rect, &selection);
+        }
+
+        let preview = shell
+            .canvas_preview_lines
+            .iter()
+            .take(42)
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = preview.encode_utf16().collect::<Vec<u16>>();
+        let text_format = self.create_text_format()?;
+        let text_brush = self.create_brush(self.theme.text_primary.as_d2d())?;
+        unsafe {
+            self.d2d_context.DrawText(
+                &text,
+                &text_format,
+                &text_rect,
+                &text_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+
+        if shell.canvas_cursor_visible {
+            let cursor_brush = self.create_brush(self.theme.accent.as_d2d())?;
+            unsafe {
+                let cursor = D2D_RECT_F {
+                    left: text_rect.left + 2.0,
+                    top: text_rect.top + 2.0,
+                    right: text_rect.left + 4.0,
+                    bottom: text_rect.top + 22.0,
+                };
+                self.d2d_context.FillRectangle(&cursor, &cursor_brush);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn draw_canvas_scrollbars(&self, canvas_rect: D2D_RECT_F, shell: &ShellRenderState) -> Result<()> {
+        if !shell.canvas_scrollbar_visible && shell.canvas_scrollbar_alpha <= 0.01 {
+            return Ok(());
+        }
+
+        let alpha = shell.canvas_scrollbar_alpha.clamp(0.0, 1.0);
+        let thumb_color = crate::ui::Color::rgba(
+            self.theme.text_secondary.r,
+            self.theme.text_secondary.g,
+            self.theme.text_secondary.b,
+            0.45 * alpha,
+        );
+        let thumb_brush = self.create_brush(thumb_color.as_d2d())?;
+        let thickness = 6.0;
+        let viewport_h = shell.canvas_viewport_height.max(1.0);
+        let viewport_w = shell.canvas_viewport_width.max(1.0);
+        let content_h = shell.canvas_content_height.max(viewport_h);
+        let content_w = shell.canvas_content_width.max(viewport_w);
+
+        unsafe {
+            if content_h > viewport_h + 1.0 {
+                let thumb_h = ((viewport_h / content_h) * viewport_h).clamp(28.0, viewport_h - 6.0);
+                let max_track = (viewport_h - thumb_h).max(1.0);
+                let max_scroll = (content_h - viewport_h).max(1.0);
+                let thumb_offset = (shell.canvas_scroll_y / max_scroll).clamp(0.0, 1.0) * max_track;
+                let vbar = D2D_RECT_F {
+                    left: canvas_rect.right - thickness - 2.0,
+                    top: canvas_rect.top + thumb_offset + 2.0,
+                    right: canvas_rect.right - 2.0,
+                    bottom: canvas_rect.top + thumb_offset + thumb_h,
+                };
+                self.d2d_context.FillRectangle(&vbar, &thumb_brush);
+            }
+
+            if content_w > viewport_w + 1.0 {
+                let thumb_w = ((viewport_w / content_w) * viewport_w).clamp(28.0, viewport_w - 6.0);
+                let max_track = (viewport_w - thumb_w).max(1.0);
+                let max_scroll = (content_w - viewport_w).max(1.0);
+                let thumb_offset = (shell.canvas_scroll_x / max_scroll).clamp(0.0, 1.0) * max_track;
+                let hbar = D2D_RECT_F {
+                    left: canvas_rect.left + thumb_offset + 2.0,
+                    top: canvas_rect.bottom - thickness - 2.0,
+                    right: canvas_rect.left + thumb_offset + thumb_w,
+                    bottom: canvas_rect.bottom - 2.0,
+                };
+                self.d2d_context.FillRectangle(&hbar, &thumb_brush);
+            }
+        }
+
+        Ok(())
     }
 
     fn fill_rect(&self, rect: D2D_RECT_F, color: crate::ui::Color) -> Result<()> {

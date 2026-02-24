@@ -29,7 +29,7 @@ use windows::{
                 RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
                 SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
                 WINDOW_EX_STYLE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_KEYDOWN,
-                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
                 WM_SETTINGCHANGE, WM_SIZE,
                 WNDCLASSEXW,
                 WS_OVERLAPPEDWINDOW, WS_VISIBLE,
@@ -42,9 +42,10 @@ use windows::{
 use crate::{
     app::AppState,
     document::model::{Block, DocumentModel},
+    render::canvas::PageLayoutMode,
     render::d2d::{D2DRenderer, ShellRenderState},
     settings::schema::Settings,
-    theme::{Theme, ThemeManager, backgrounds::from_canvas_preference},
+    theme::{Theme, ThemeManager, backgrounds::{BackgroundKind, from_canvas_preference}},
     ui::{
         InputEvent as UiInputEvent,
         Point as UiPoint,
@@ -257,6 +258,21 @@ fn sidebar_splitter_hit_test(state: &WindowState, point: UiPoint) -> bool {
         && point.y <= bounds.y + bounds.height
 }
 
+fn canvas_viewport_size(state: &WindowState, width: f32, height: f32) -> (f32, f32) {
+    let tab_h = if state.app_state.show_tabs { 36.0 } else { 0.0 };
+    let status_h = if state.app_state.show_statusbar { 28.0 } else { 0.0 };
+    let sidebar_w = if state.app_state.show_sidebar {
+        state.app_state.sidebar_width.clamp(200.0, 400.0)
+    } else {
+        0.0
+    };
+    let toolbar_h = if state.app_state.show_toolbar { 44.0 } else { 0.0 };
+    (
+        (width - sidebar_w).max(1.0),
+        (height - tab_h - toolbar_h - status_h).max(1.0),
+    )
+}
+
 fn relayout_shell(state: &mut WindowState, width: f32, height: f32) {
     let tab_h = if state.app_state.show_tabs { 36.0 } else { 0.0 };
     let status_h = if state.app_state.show_statusbar { 28.0 } else { 0.0 };
@@ -311,6 +327,12 @@ fn relayout_shell(state: &mut WindowState, width: f32, height: f32) {
         },
         state.dpi,
     );
+
+    let (canvas_w, canvas_h) = canvas_viewport_size(state, width, height);
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        tab.canvas.set_viewport(canvas_w, canvas_h);
+        tab.canvas.clamp_scroll(&tab.document);
+    }
 }
 
 fn sync_theme_from_settings(state: &mut WindowState) -> bool {
@@ -376,15 +398,143 @@ fn collect_document_stats(document: &DocumentModel) -> (usize, usize) {
     (words, chars)
 }
 
+fn collect_preview_lines(document: &DocumentModel, max_lines: usize) -> Vec<String> {
+    fn push_block_lines(block: &Block, out: &mut Vec<String>, max_lines: usize) {
+        if out.len() >= max_lines {
+            return;
+        }
+        match block {
+            Block::Paragraph(p) => {
+                let text = p.runs.iter().map(|r| r.text.as_str()).collect::<String>();
+                if !text.trim().is_empty() {
+                    out.push(text);
+                }
+            }
+            Block::Heading(h) => {
+                let text = h.runs.iter().map(|r| r.text.as_str()).collect::<String>();
+                if !text.trim().is_empty() {
+                    out.push(text.to_uppercase());
+                }
+            }
+            Block::CodeBlock(c) => {
+                let line = if c.code.is_empty() { "code block" } else { &c.code };
+                out.push(line.lines().next().unwrap_or("code block").to_string());
+            }
+            Block::List(list) => {
+                for item in &list.items {
+                    if out.len() >= max_lines {
+                        break;
+                    }
+                    for nested in &item.content {
+                        push_block_lines(nested, out, max_lines);
+                    }
+                }
+            }
+            Block::Table(table) => {
+                out.push(format!("Table: {} rows", table.rows.len()));
+            }
+            Block::BlockQuote(q) => {
+                for nested in &q.blocks {
+                    if out.len() >= max_lines {
+                        break;
+                    }
+                    push_block_lines(nested, out, max_lines);
+                }
+            }
+            Block::Image(_) => out.push("[Image]".to_string()),
+            Block::PageBreak => out.push(String::new()),
+            Block::HorizontalRule => out.push("----".to_string()),
+        }
+    }
+
+    let mut out = Vec::new();
+    for block in &document.content {
+        push_block_lines(block, &mut out, max_lines);
+        if out.len() >= max_lines {
+            break;
+        }
+    }
+
+    if out.is_empty() {
+        out.push("Start typing here...".to_string());
+    }
+
+    out
+}
+
 fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
-    let (word_count, character_count) = state
-        .tabs
-        .active_tab()
-        .map(|tab| collect_document_stats(&tab.document))
-        .unwrap_or((0, 0));
+    let mut word_count = 0usize;
+    let mut character_count = 0usize;
+    let mut page_index = 1usize;
+    let mut page_count = 1usize;
+    let mut view_mode = "Page".to_string();
+    let mut zoom_percent = 100u16;
+    let mut file_format = "DOCX".to_string();
+    let mut line = 1usize;
+    let mut column = 1usize;
+
+    let mut canvas_page_rects = Vec::new();
+    let mut canvas_preview_lines = Vec::new();
+    let mut canvas_show_margin_guides = false;
+    let mut canvas_cursor_visible = true;
+    let mut canvas_scrollbar_visible = false;
+    let mut canvas_scrollbar_alpha = 0.0f32;
+    let mut canvas_viewport_width = 1.0f32;
+    let mut canvas_viewport_height = 1.0f32;
+    let mut canvas_content_width = 1.0f32;
+    let mut canvas_content_height = 1.0f32;
+    let mut canvas_scroll_x = 0.0f32;
+    let mut canvas_scroll_y = 0.0f32;
+
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        (word_count, character_count) = collect_document_stats(&tab.document);
+        let visible_indices = tab.canvas.cull_and_cache_visible_pages(&tab.document);
+        let all_page_rects = tab.canvas.page_rects(&tab.document);
+        let first_visible_index = visible_indices.first().copied();
+
+        for page_index_visible in visible_indices {
+            if let Some(rect) = all_page_rects.get(page_index_visible).copied() {
+                canvas_page_rects.push(rect);
+            }
+        }
+
+        page_count = all_page_rects.len().max(1);
+        page_index = first_visible_index.map(|idx| idx + 1).unwrap_or(1);
+
+        canvas_show_margin_guides = tab.canvas.show_margin_guides;
+        canvas_cursor_visible = tab.canvas.cursor.visible;
+        canvas_scrollbar_visible = tab.canvas.scrollbar.visible;
+        canvas_scrollbar_alpha = tab.canvas.scrollbar.alpha;
+        canvas_viewport_width = tab.canvas.viewport.width;
+        canvas_viewport_height = tab.canvas.viewport.height;
+        canvas_scroll_x = tab.canvas.scroll.x;
+        canvas_scroll_y = tab.canvas.scroll.y;
+        let content_size = tab.canvas.content_size(&tab.document);
+        canvas_content_width = content_size.width.max(1.0);
+        canvas_content_height = content_size.height.max(1.0);
+
+        view_mode = match tab.canvas.layout_mode {
+            PageLayoutMode::SinglePage => "Single Page".to_string(),
+            PageLayoutMode::Continuous => "Continuous".to_string(),
+            PageLayoutMode::ReadMode => "Read Mode".to_string(),
+        };
+        zoom_percent = (tab.canvas.zoom * 100.0).round().clamp(25.0, 500.0) as u16;
+        file_format = format!("{:?}", tab.document.metadata.format).to_uppercase();
+        column = tab.cursor.primary.offset.saturating_add(1);
+        line = 1;
+        canvas_preview_lines = collect_preview_lines(&tab.document, 40);
+    }
+
     state.statusbar.set_info(StatusBarInfo {
+        page_index,
+        page_count,
         word_count,
         character_count,
+        view_mode: view_mode.clone(),
+        line,
+        column,
+        zoom_percent,
+        file_format: file_format.clone(),
         ..StatusBarInfo::default()
     });
 
@@ -416,6 +566,18 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         status_left: state.statusbar.left_text(),
         status_right: state.statusbar.right_text(),
         canvas_background: from_canvas_preference(&state.app_state.settings.appearance.canvas_background),
+        canvas_page_rects,
+        canvas_preview_lines,
+        canvas_show_margin_guides,
+        canvas_cursor_visible,
+        canvas_scrollbar_visible,
+        canvas_scrollbar_alpha,
+        canvas_viewport_width,
+        canvas_viewport_height,
+        canvas_content_width,
+        canvas_content_height,
+        canvas_scroll_x,
+        canvas_scroll_y,
     }
 }
 
@@ -576,14 +738,63 @@ unsafe extern "system" fn window_proc(
                 let dt = (now - state.last_ui_tick).as_secs_f32().clamp(0.0, 0.25);
                 state.last_ui_tick = now;
                 state.sidebar.tick(dt);
+                let mut needs_next_frame = false;
+                if let Some(tab) = state.tabs.active_tab_mut() {
+                    needs_next_frame |= tab.canvas.update(dt);
+                    tab.canvas.clamp_scroll(&tab.document);
+                }
+                let background = from_canvas_preference(&state.app_state.settings.appearance.canvas_background);
+                if matches!(background.kind, BackgroundKind::AnimatedGradient { .. }) {
+                    needs_next_frame = true;
+                }
                 let shell = build_shell_render_state(state);
                 if let Some(renderer) = &mut state.renderer {
                     let _ = renderer.render(&shell);
+                }
+
+                if needs_next_frame {
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                 }
             }
 
             let _ = unsafe { EndPaint(hwnd, &paint) };
             LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
+                let ctrl_down = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+                let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                let delta = ((wparam.0 >> 16) as i16 as f32) / 120.0;
+
+                let mut client = RECT::default();
+                let _ = unsafe { GetClientRect(hwnd, &mut client) };
+                let client_width = (client.right - client.left).max(1) as f32;
+                let client_height = (client.bottom - client.top).max(1) as f32;
+                let (canvas_w, canvas_h) = canvas_viewport_size(state, client_width, client_height);
+                let cursor_in_canvas = UiPoint {
+                    x: canvas_w * 0.5,
+                    y: canvas_h * 0.5,
+                };
+
+                if let Some(tab) = state.tabs.active_tab_mut() {
+                    tab.canvas.set_viewport(canvas_w, canvas_h);
+                    if ctrl_down {
+                        tab.canvas.handle_mouse_wheel(delta, true, cursor_in_canvas);
+                        state.app_state.status_text = format!("Zoom: {}%", (tab.canvas.zoom_target * 100.0).round() as u16);
+                    } else if shift_down {
+                        tab.canvas.handle_horizontal_wheel(delta);
+                        state.app_state.status_text = "Horizontal scroll".to_string();
+                    } else {
+                        tab.canvas.handle_mouse_wheel(delta, false, cursor_in_canvas);
+                        state.app_state.status_text = "Scroll".to_string();
+                    }
+                    tab.canvas.clamp_scroll(&tab.document);
+                }
+
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_KEYDOWN => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {

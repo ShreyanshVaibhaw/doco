@@ -157,6 +157,47 @@ impl CanvasState {
         }
     }
 
+    pub fn handle_horizontal_wheel(&mut self, delta: f32) {
+        let impulse = -delta * 3.0;
+        self.scroll.velocity_x += impulse;
+        self.scroll_anim_x = Some(Animation::new(self.scroll.x, self.scroll.x + impulse * 0.35, 0.20, Easing::Spring));
+        self.scrollbar.visible = true;
+        self.mark_dirty_full();
+    }
+
+    pub fn content_size(&self, document: &DocumentModel) -> Size {
+        let (page_width, page_height) = page_dimensions_points(document);
+        let scaled_w = page_width * self.zoom;
+        let scaled_h = page_height * self.zoom;
+
+        match self.layout_mode {
+            PageLayoutMode::ReadMode => Size {
+                width: (self.viewport.width * 0.88).max(540.0),
+                height: (document.content.len() as f32 * 26.0 * self.zoom).max(self.viewport.height),
+            },
+            PageLayoutMode::SinglePage => Size {
+                width: scaled_w,
+                height: scaled_h,
+            },
+            PageLayoutMode::Continuous => {
+                let page_count = document.pages.len().max(1);
+                Size {
+                    width: scaled_w,
+                    height: (page_count as f32 * scaled_h)
+                        + ((page_count.saturating_sub(1)) as f32 * PAGE_GAP),
+                }
+            }
+        }
+    }
+
+    pub fn clamp_scroll(&mut self, document: &DocumentModel) {
+        let content = self.content_size(document);
+        let max_x = (content.width - self.viewport.width).max(0.0);
+        let max_y = (content.height - self.viewport.height).max(0.0);
+        self.scroll.x = self.scroll.x.clamp(0.0, max_x);
+        self.scroll.y = self.scroll.y.clamp(0.0, max_y);
+    }
+
     pub fn update(&mut self, dt_s: f32) -> bool {
         let mut animating = false;
 
@@ -225,20 +266,20 @@ impl CanvasState {
 
         match self.layout_mode {
             PageLayoutMode::ReadMode => vec![Rect {
-                x: 0.0,
+                x: -self.scroll.x,
                 y: -self.scroll.y,
                 width: (self.viewport.width * 0.88).max(540.0),
                 height: (document.content.len() as f32 * 26.0 * self.zoom).max(self.viewport.height),
             }],
             PageLayoutMode::SinglePage => vec![Rect {
-                x: ((self.viewport.width - scaled_w) * 0.5).max(0.0),
+                x: ((self.viewport.width - scaled_w) * 0.5).max(0.0) - self.scroll.x,
                 y: ((self.viewport.height - scaled_h) * 0.5).max(0.0) - self.scroll.y,
                 width: scaled_w,
                 height: scaled_h,
             }],
             PageLayoutMode::Continuous => {
                 let page_count = document.pages.len().max(1);
-                let left = ((self.viewport.width - scaled_w) * 0.5).max(0.0);
+                let left = ((self.viewport.width - scaled_w) * 0.5).max(0.0) - self.scroll.x;
                 (0..page_count)
                     .map(|i| Rect {
                         x: left,
