@@ -37,6 +37,7 @@ use windows::{
 };
 
 use crate::{
+    app::AppState,
     render::d2d::D2DRenderer,
     theme::Theme,
     window::integration::{
@@ -62,10 +63,10 @@ struct WindowState {
     theme: Theme,
     debug_panel_visible: bool,
     dropped_files: Vec<PathBuf>,
-    drop_overlay_text: Option<String>,
     jump_list: JumpListState,
     print_state: PrintState,
     startup_files: Vec<PathBuf>,
+    app_state: AppState,
 }
 
 impl AppWindow {
@@ -114,10 +115,10 @@ impl AppWindow {
             theme,
             debug_panel_visible: false,
             dropped_files: Vec::new(),
-            drop_overlay_text: None,
             jump_list: JumpListState::with_default_tasks(),
             print_state: PrintState::default(),
             startup_files: parse_startup_files_from_cli(),
+            app_state: AppState::default(),
         });
         let state_ptr = Box::into_raw(state);
 
@@ -229,8 +230,8 @@ unsafe extern "system" fn window_proc(
 
                 if !state.startup_files.is_empty() {
                     state.dropped_files = state.startup_files.clone();
-                    state.drop_overlay_text =
-                        Some(format!("Opening {} file(s) from command line", state.startup_files.len()));
+                    state.app_state.status_text =
+                        format!("Opening {} file(s) from command line", state.startup_files.len());
                     for path in &state.startup_files {
                         state.jump_list.add_recent_file(path.clone());
                     }
@@ -288,7 +289,7 @@ unsafe extern "system" fn window_proc(
 
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
                 if let Some(renderer) = &mut state.renderer {
-                    let _ = renderer.render();
+                    let _ = renderer.render(&state.app_state);
                 }
             }
 
@@ -306,19 +307,63 @@ unsafe extern "system" fn window_proc(
                     if let Some(renderer) = &mut state.renderer {
                         renderer.set_debug_panel_visible(state.debug_panel_visible);
                     }
+                    state.app_state.show_debug_panel = state.debug_panel_visible;
+                    state.app_state.status_text = if state.debug_panel_visible {
+                        "Debug panel enabled".to_string()
+                    } else {
+                        "Debug panel hidden".to_string()
+                    };
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
                 }
 
                 if ctrl_down && !shift_down && vk == 0x50 {
                     state.print_state.request_print_dialog();
-                    state.drop_overlay_text = Some("Print dialog requested".to_string());
+                    state.app_state.status_text = "Print dialog requested".to_string();
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
                 }
 
                 if ctrl_down && !shift_down && vk == 0xBC {
-                    state.drop_overlay_text = Some("Settings requested".to_string());
+                    state.app_state.show_settings = !state.app_state.show_settings;
+                    state.app_state.status_text = if state.app_state.show_settings {
+                        "Settings toggled on".to_string()
+                    } else {
+                        "Settings toggled off".to_string()
+                    };
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+
+                if ctrl_down && !shift_down && vk == 0x42 {
+                    state.app_state.show_sidebar = !state.app_state.show_sidebar;
+                    state.app_state.status_text = if state.app_state.show_sidebar {
+                        "Sidebar shown".to_string()
+                    } else {
+                        "Sidebar hidden".to_string()
+                    };
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+
+                if ctrl_down && !shift_down && vk == 0x54 {
+                    state.app_state.show_toolbar = !state.app_state.show_toolbar;
+                    state.app_state.status_text = if state.app_state.show_toolbar {
+                        "Toolbar shown".to_string()
+                    } else {
+                        "Toolbar hidden".to_string()
+                    };
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+
+                if ctrl_down && !shift_down && vk == 0x4C {
+                    state.app_state.show_statusbar = !state.app_state.show_statusbar;
+                    state.app_state.status_text = if state.app_state.show_statusbar {
+                        "Status bar shown".to_string()
+                    } else {
+                        "Status bar hidden".to_string()
+                    };
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
                 }
@@ -331,7 +376,7 @@ unsafe extern "system" fn window_proc(
                 let payload = unsafe { extract_drop_payload(HDROP(wparam.0 as *mut c_void)) };
                 state.dropped_files = payload.files.clone();
 
-                state.drop_overlay_text = Some(match payload.action {
+                state.app_state.status_text = match payload.action {
                     DropAction::OpenFilesInTabs => {
                         for path in &payload.files {
                             state.jump_list.add_recent_file(path.clone());
@@ -342,7 +387,7 @@ unsafe extern "system" fn window_proc(
                         format!("Drop to insert image: {} file(s)", payload.files.len())
                     }
                     DropAction::Ignore => "Unsupported dropped content".to_string(),
-                });
+                };
 
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
