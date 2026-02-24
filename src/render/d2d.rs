@@ -12,7 +12,7 @@ use windows::{
                 D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device,
                 ID2D1DeviceContext, ID2D1Factory1, ID2D1Image, ID2D1SolidColorBrush,
             },
-            Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+            Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
             Direct3D11::{
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
                 ID3D11DeviceContext,
@@ -66,21 +66,7 @@ impl D2DRenderer {
         unsafe {
             let d2d_factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
 
-            let mut d3d_device = None;
-            let mut d3d_context = None;
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut d3d_device),
-                None,
-                Some(&mut d3d_context),
-            )?;
-            let d3d_device = d3d_device.expect("D3D11 device should be created");
-            let d3d_context = d3d_context.expect("D3D11 context should be created");
+            let (d3d_device, d3d_context) = Self::create_d3d_device()?;
 
             let dxgi_device: IDXGIDevice = d3d_device.cast()?;
             let adapter = dxgi_device.GetAdapter()?;
@@ -130,6 +116,43 @@ impl D2DRenderer {
 
             renderer.recreate_target_bitmap()?;
             Ok(renderer)
+        }
+    }
+
+    fn create_d3d_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+        let hardware_result = Self::create_d3d_device_for_driver(D3D_DRIVER_TYPE_HARDWARE);
+        if let Ok(devices) = hardware_result {
+            return Ok(devices);
+        }
+
+        if let Err(error) = hardware_result {
+            eprintln!(
+                "Hardware D3D11 initialization failed, falling back to WARP software renderer: {error:?}"
+            );
+        }
+        Self::create_d3d_device_for_driver(D3D_DRIVER_TYPE_WARP)
+    }
+
+    fn create_d3d_device_for_driver(
+        driver_type: windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE,
+    ) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+        unsafe {
+            let mut d3d_device = None;
+            let mut d3d_context = None;
+            D3D11CreateDevice(
+                None,
+                driver_type,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut d3d_device),
+                None,
+                Some(&mut d3d_context),
+            )?;
+            let d3d_device = d3d_device.expect("D3D11 device should be created");
+            let d3d_context = d3d_context.expect("D3D11 context should be created");
+            Ok((d3d_device, d3d_context))
         }
     }
 

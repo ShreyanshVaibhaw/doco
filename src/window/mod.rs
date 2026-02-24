@@ -220,8 +220,11 @@ unsafe extern "system" fn window_proc(
                 let width = (client.right - client.left).max(1) as u32;
                 let height = (client.bottom - client.top).max(1) as u32;
 
-                if let Ok(renderer) = D2DRenderer::new(hwnd, width, height, state.dpi, state.theme.clone()) {
-                    state.renderer = Some(renderer);
+                match D2DRenderer::new(hwnd, width, height, state.dpi, state.theme.clone()) {
+                    Ok(renderer) => state.renderer = Some(renderer),
+                    Err(error) => {
+                        eprintln!("Renderer initialization failed: {error:?}");
+                    }
                 }
 
                 if !state.startup_files.is_empty() {
