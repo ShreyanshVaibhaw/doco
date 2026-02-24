@@ -6,7 +6,7 @@ use windows::{
         Foundation::{HMODULE, HWND, RECT},
         Graphics::{
             Direct2D::{
-                Common::{D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT},
+                Common::{D2D_RECT_F, D2D1_ALPHA_MODE_IGNORE, D2D1_PIXEL_FORMAT},
                 D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
                 D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE,
                 D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device,
@@ -22,10 +22,14 @@ use windows::{
                 IDWriteFactory, IDWriteTextFormat,
             },
             Dxgi::{
-                Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC},
+                Common::{
+                    DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_UNSPECIFIED, DXGI_FORMAT_B8G8R8A8_UNORM,
+                    DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+                },
                 DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
-                DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice,
-                IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
+                DXGI_SWAP_EFFECT_DISCARD, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISurface,
+                IDXGISwapChain1,
             },
         },
         UI::WindowsAndMessaging::GetClientRect,
@@ -72,26 +76,12 @@ impl D2DRenderer {
             let adapter = dxgi_device.GetAdapter()?;
             let dxgi_factory: IDXGIFactory2 = adapter.GetParent()?;
 
-            let swap_chain_desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: width,
-                Height: height,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                Stereo: false.into(),
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: 2,
-                Scaling: DXGI_SCALING_STRETCH,
-                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-                Flags: 0,
-            };
-
-            let swap_chain = dxgi_factory.CreateSwapChainForHwnd(
+            let swap_chain = Self::create_swap_chain_for_hwnd(
+                &dxgi_factory,
                 &d3d_device,
                 hwnd,
-                &swap_chain_desc,
-                None,
-                None,
+                width,
+                height,
             )?;
 
             let d2d_device = d2d_factory.CreateDevice(&dxgi_device)?;
@@ -154,6 +144,57 @@ impl D2DRenderer {
             let d3d_context = d3d_context.expect("D3D11 context should be created");
             Ok((d3d_device, d3d_context))
         }
+    }
+
+    fn create_swap_chain_for_hwnd(
+        dxgi_factory: &IDXGIFactory2,
+        d3d_device: &ID3D11Device,
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+    ) -> Result<IDXGISwapChain1> {
+        let attempts = [
+            (DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, 2, DXGI_ALPHA_MODE_IGNORE, "flip_sequential"),
+            (DXGI_SWAP_EFFECT_FLIP_DISCARD, 2, DXGI_ALPHA_MODE_IGNORE, "flip_discard"),
+            (DXGI_SWAP_EFFECT_DISCARD, 1, DXGI_ALPHA_MODE_UNSPECIFIED, "discard"),
+        ];
+
+        let mut last_error = None;
+        for (swap_effect, buffer_count, alpha_mode, label) in attempts {
+            let swap_chain_desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: width,
+                Height: height,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                Stereo: false.into(),
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: buffer_count,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: swap_effect,
+                AlphaMode: alpha_mode,
+                Flags: 0,
+            };
+
+            let result = unsafe {
+                dxgi_factory.CreateSwapChainForHwnd(
+                    d3d_device,
+                    hwnd,
+                    &swap_chain_desc,
+                    None,
+                    None,
+                )
+            };
+
+            match result {
+                Ok(swap_chain) => return Ok(swap_chain),
+                Err(error) => {
+                    eprintln!("Swap chain creation attempt '{label}' failed: {error:?}");
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.expect("At least one swap chain creation attempt must run"))
     }
 
     pub fn set_dpi(&mut self, dpi: f32) {
@@ -396,7 +437,7 @@ impl D2DRenderer {
         let bitmap_props = D2D1_BITMAP_PROPERTIES1 {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                alphaMode: D2D1_ALPHA_MODE_IGNORE,
             },
             dpiX: self.dpi,
             dpiY: self.dpi,
