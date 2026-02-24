@@ -39,12 +39,28 @@ use windows::{
 use windows_numerics::Vector2;
 
 use crate::{
-    app::AppState,
     render::perf::{DebugPerformancePanel, query_process_working_set_bytes},
     theme::Theme,
 };
 
 const D2DERR_RECREATE_TARGET: HRESULT = HRESULT(0x8899000C_u32 as i32);
+
+#[derive(Debug, Clone, Default)]
+pub struct ShellRenderState {
+    pub show_tabs: bool,
+    pub show_sidebar: bool,
+    pub sidebar_width: f32,
+    pub sidebar_resizing: bool,
+    pub show_toolbar: bool,
+    pub show_statusbar: bool,
+    pub status_text: String,
+    pub tab_titles: Vec<String>,
+    pub active_tab: usize,
+    pub toolbar_labels: Vec<String>,
+    pub active_sidebar_panel: String,
+    pub status_left: String,
+    pub status_right: String,
+}
 
 pub struct D2DRenderer {
     hwnd: HWND,
@@ -220,7 +236,7 @@ impl D2DRenderer {
         Ok(())
     }
 
-    pub fn render(&mut self, app_state: &AppState) -> Result<()> {
+    pub fn render(&mut self, shell: &ShellRenderState) -> Result<()> {
         crate::profile_scope!("renderer.frame");
         let frame_start = Instant::now();
 
@@ -229,7 +245,7 @@ impl D2DRenderer {
             let clear = self.theme.window_bg.as_d2d();
             self.d2d_context.Clear(Some(&clear));
 
-            self.draw_shell_placeholder(app_state)?;
+            self.draw_shell_placeholder(shell)?;
 
             match self.d2d_context.EndDraw(None, None) {
                 Ok(()) => {
@@ -259,7 +275,7 @@ impl D2DRenderer {
         &self.debug_panel
     }
 
-    fn draw_shell_placeholder(&self, app_state: &AppState) -> Result<()> {
+    fn draw_shell_placeholder(&self, shell: &ShellRenderState) -> Result<()> {
         unsafe {
             let mut rect = RECT::default();
             GetClientRect(self.hwnd, &mut rect)?;
@@ -267,14 +283,14 @@ impl D2DRenderer {
             let width = (rect.right - rect.left) as f32;
             let height = (rect.bottom - rect.top) as f32;
 
-            let tab_h = if app_state.show_tabs { 36.0 } else { 0.0 };
-            let sidebar_w = if app_state.show_sidebar {
-                app_state.sidebar_width.clamp(180.0, 420.0)
+            let tab_h = if shell.show_tabs { 36.0 } else { 0.0 };
+            let sidebar_w = if shell.show_sidebar {
+                shell.sidebar_width.clamp(200.0, 400.0).min((width - 80.0).max(0.0))
             } else {
                 0.0
             };
-            let toolbar_h = if app_state.show_toolbar { 44.0 } else { 0.0 };
-            let status_h = if app_state.show_statusbar { 28.0 } else { 0.0 };
+            let toolbar_h = if shell.show_toolbar { 44.0 } else { 0.0 };
+            let status_h = if shell.show_statusbar { 28.0 } else { 0.0 };
 
             let tab_rect = D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: tab_h };
             let sidebar_rect = D2D_RECT_F {
@@ -337,6 +353,20 @@ impl D2DRenderer {
                     1.0,
                     None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
                 );
+
+                let splitter_color = if shell.sidebar_resizing {
+                    self.theme.accent
+                } else {
+                    self.theme.border_default
+                };
+                let splitter_brush = self.create_brush(splitter_color.as_d2d())?;
+                let splitter_rect = D2D_RECT_F {
+                    left: (sidebar_w - 1.5).max(0.0),
+                    top: tab_h + 4.0,
+                    right: sidebar_w + 1.5,
+                    bottom: (height - status_h - 4.0).max(tab_h + 6.0),
+                };
+                self.d2d_context.FillRectangle(&splitter_rect, &splitter_brush);
             }
 
             let text_brush = self.create_brush(self.theme.text_primary.as_d2d())?;
@@ -356,9 +386,24 @@ impl D2DRenderer {
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
+
+                let active_panel = shell.active_sidebar_panel.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &active_panel,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: 14.0,
+                        top: tab_h + 34.0,
+                        right: sidebar_w - 8.0,
+                        bottom: tab_h + 58.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
             }
 
-            let status = app_state.status_text.encode_utf16().collect::<Vec<u16>>();
+            let status = shell.status_text.encode_utf16().collect::<Vec<u16>>();
             if status_h > 0.0 {
                 self.d2d_context.DrawText(
                     &status,
@@ -373,28 +418,98 @@ impl D2DRenderer {
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
+
+                let status_right = shell.status_right.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &status_right,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: width - 420.0,
+                        top: height - status_h + 4.0,
+                        right: width - 10.0,
+                        bottom: height - 2.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let status_left = shell.status_left.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &status_left,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: 14.0,
+                        top: height - status_h + 4.0,
+                        right: (width - 440.0).max(100.0),
+                        bottom: height - 2.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
             }
 
-            let hint = format!(
-                "Ctrl+B Sidebar [{}]  Ctrl+T Toolbar [{}]  Ctrl+L Status [{}]",
-                if app_state.show_sidebar { "On" } else { "Off" },
-                if app_state.show_toolbar { "On" } else { "Off" },
-                if app_state.show_statusbar { "On" } else { "Off" }
-            );
-            let hint = hint.encode_utf16().collect::<Vec<u16>>();
-            self.d2d_context.DrawText(
-                &hint,
-                &text_format,
-                &D2D_RECT_F {
-                    left: sidebar_w + 16.0,
-                    top: tab_h + toolbar_h + 12.0,
-                    right: width - 12.0,
-                    bottom: tab_h + toolbar_h + 40.0,
-                },
-                &text_brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
+            if tab_h > 0.0 && !shell.tab_titles.is_empty() {
+                let mut x = 8.0;
+                for (idx, title) in shell.tab_titles.iter().take(8).enumerate() {
+                    let tab_w = ((width - 16.0) / shell.tab_titles.len().min(8) as f32).clamp(120.0, 220.0);
+                    let rect = D2D_RECT_F {
+                        left: x,
+                        top: 4.0,
+                        right: (x + tab_w).min(width - 8.0),
+                        bottom: tab_h - 4.0,
+                    };
+                    let brush = if idx == shell.active_tab {
+                        self.create_brush(self.theme.surface_hover.as_d2d())?
+                    } else {
+                        self.create_brush(self.theme.surface_secondary.as_d2d())?
+                    };
+                    self.d2d_context.FillRectangle(&rect, &brush);
+                    let text = title.encode_utf16().collect::<Vec<u16>>();
+                    self.d2d_context.DrawText(
+                        &text,
+                        &text_format,
+                        &D2D_RECT_F {
+                            left: rect.left + 10.0,
+                            top: rect.top + 6.0,
+                            right: rect.right - 6.0,
+                            bottom: rect.bottom - 4.0,
+                        },
+                        &text_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    x += tab_w + 6.0;
+                    if x > width - 80.0 {
+                        break;
+                    }
+                }
+            }
+
+            if toolbar_h > 0.0 && !shell.toolbar_labels.is_empty() {
+                let mut x = sidebar_w + 12.0;
+                for label in shell.toolbar_labels.iter().take(12) {
+                    let t = label.encode_utf16().collect::<Vec<u16>>();
+                    self.d2d_context.DrawText(
+                        &t,
+                        &text_format,
+                        &D2D_RECT_F {
+                            left: x,
+                            top: tab_h + 11.0,
+                            right: x + 80.0,
+                            bottom: tab_h + toolbar_h - 6.0,
+                        },
+                        &text_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    x += 74.0;
+                    if x > width - 70.0 {
+                        break;
+                    }
+                }
+            }
 
             if self.debug_panel.visible {
                 let panel_rect = D2D_RECT_F {
