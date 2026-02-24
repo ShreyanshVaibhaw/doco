@@ -1,7 +1,7 @@
 use std::{
     ffi::c_void,
     mem::size_of,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Instant,
 };
 
@@ -41,7 +41,14 @@ use windows::{
 
 use crate::{
     app::AppState,
-    document::model::{Block, DocumentModel},
+    document::{
+        DocumentFormat,
+        detect_format,
+        docx::parser::parse_docx,
+        markdown::MarkdownDocument,
+        model::{Block, BlockId, DocumentModel},
+        txt::TextDocument,
+    },
     render::canvas::PageLayoutMode,
     render::d2d::{D2DRenderer, ShellRenderState},
     settings::schema::Settings,
@@ -51,9 +58,9 @@ use crate::{
         Point as UiPoint,
         Rect as UiRect,
         UIComponent,
-        sidebar::{Sidebar, SidebarPanel},
+        sidebar::{Sidebar, SidebarIntent, SidebarPanel},
         statusbar::{StatusAction, StatusBar, StatusBarInfo},
-        tabs::TabsBar,
+        tabs::{TabKind, TabsBar},
         toolbar::{Toolbar, ToolbarAction},
     },
     window::integration::{
@@ -256,6 +263,129 @@ fn sidebar_splitter_hit_test(state: &WindowState, point: UiPoint) -> bool {
         && point.x <= splitter_x + half_width
         && point.y >= bounds.y
         && point.y <= bounds.y + bounds.height
+}
+
+fn document_title_from_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("Document")
+        .to_string()
+}
+
+fn load_document_for_path(path: &Path) -> DocumentModel {
+    let detected = detect_format(path);
+    let mut model = match detected {
+        DocumentFormat::Docx => parse_docx(path).unwrap_or_default(),
+        DocumentFormat::Markdown => MarkdownDocument::load_from_path(path)
+            .map(|doc| doc.to_document_model())
+            .unwrap_or_default(),
+        DocumentFormat::Text => TextDocument::load_from_path(path)
+            .map(|doc| doc.to_document_model())
+            .unwrap_or_default(),
+        DocumentFormat::Pdf | DocumentFormat::Unknown => DocumentModel::default(),
+    };
+
+    model.metadata.file_path = Some(path.to_path_buf());
+    if model.metadata.title.is_empty() {
+        model.metadata.title = document_title_from_path(path);
+    }
+    if matches!(model.metadata.format, DocumentFormat::Unknown) {
+        model.metadata.format = detected;
+    }
+    model
+}
+
+fn sync_sidebar_with_active_tab(state: &mut WindowState) {
+    let mut root_path = None;
+    if let Some(tab) = state.tabs.active_tab() {
+        state.sidebar.populate_outline(&tab.document);
+        state
+            .sidebar
+            .set_current_outline_block(Some(tab.cursor.primary.block_id));
+        root_path = tab
+            .file_path
+            .clone()
+            .or_else(|| tab.document.metadata.file_path.clone());
+    }
+
+    if root_path.is_none() {
+        root_path = std::env::current_dir().ok();
+    }
+
+    if let Some(path) = root_path {
+        let root = if path.is_dir() {
+            path
+        } else {
+            path.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or(path)
+        };
+        if state.sidebar.file_root.as_ref() != Some(&root) {
+            let _ = state.sidebar.open_folder(root);
+        }
+    }
+}
+
+fn open_path_from_sidebar(state: &mut WindowState, path: PathBuf, new_tab: bool) {
+    let title = document_title_from_path(&path);
+    let document = load_document_for_path(&path);
+    if new_tab {
+        state.tabs.open_document_tab(title.clone(), Some(path), document);
+    } else if let Some(tab) = state.tabs.active_tab_mut() {
+        tab.title = title.clone();
+        tab.kind = TabKind::Document;
+        tab.file_path = Some(path);
+        tab.document = document;
+        tab.cursor = Default::default();
+        tab.canvas = Default::default();
+        tab.dirty = false;
+    } else {
+        state.tabs.open_document_tab(title.clone(), Some(path), document);
+    }
+    state.app_state.status_text = format!("Opened {title}");
+    sync_sidebar_with_active_tab(state);
+}
+
+fn apply_pending_sidebar_intents(state: &mut WindowState) -> bool {
+    let mut changed = false;
+    while let Some(intent) = state.sidebar.take_intent() {
+        match intent {
+            SidebarIntent::OpenFile { path, new_tab } => {
+                open_path_from_sidebar(state, path, new_tab);
+                changed = true;
+            }
+            SidebarIntent::ToggleFolder(path) => {
+                if state.sidebar.toggle_folder(&path) {
+                    changed = true;
+                }
+            }
+            SidebarIntent::JumpToBlock(block_id) => {
+                if let Some(tab) = state.tabs.active_tab_mut() {
+                    tab.cursor.primary.block_id = block_id;
+                    tab.cursor.primary.offset = 0;
+                    state.sidebar.set_current_outline_block(Some(block_id));
+                    state.app_state.status_text = format!("Jumped to block {}", block_id.0);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn block_snippet(document: &DocumentModel, block_id: BlockId) -> String {
+    for block in &document.content {
+        match block {
+            Block::Paragraph(p) if p.id == block_id => {
+                return p.runs.iter().map(|r| r.text.as_str()).collect::<String>();
+            }
+            Block::Heading(h) if h.id == block_id => {
+                return h.runs.iter().map(|r| r.text.as_str()).collect::<String>();
+            }
+            _ => {}
+        }
+    }
+    String::new()
 }
 
 fn canvas_viewport_size(state: &WindowState, width: f32, height: f32) -> (f32, f32) {
@@ -485,6 +615,7 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
     let mut canvas_content_height = 1.0f32;
     let mut canvas_scroll_x = 0.0f32;
     let mut canvas_scroll_y = 0.0f32;
+    let mut current_block = None;
 
     if let Some(tab) = state.tabs.active_tab_mut() {
         (word_count, character_count) = collect_document_stats(&tab.document);
@@ -522,8 +653,10 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         file_format = format!("{:?}", tab.document.metadata.format).to_uppercase();
         column = tab.cursor.primary.offset.saturating_add(1);
         line = 1;
+        current_block = Some(tab.cursor.primary.block_id);
         canvas_preview_lines = collect_preview_lines(&tab.document, 40);
     }
+    state.sidebar.set_current_outline_block(current_block);
 
     state.statusbar.set_info(StatusBarInfo {
         page_index,
@@ -544,6 +677,18 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         SidebarPanel::Bookmarks => "Bookmarks",
         SidebarPanel::SearchResults => "Search Results",
     };
+    let sidebar_summary = match state.sidebar.active_panel {
+        SidebarPanel::Files => state
+            .sidebar
+            .file_root
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "No folder".to_string()),
+        SidebarPanel::Outline => format!("{} headings", state.sidebar.outline_items.len()),
+        SidebarPanel::Bookmarks => format!("{} bookmarks", state.sidebar.bookmarks.len()),
+        SidebarPanel::SearchResults => state.sidebar.search_summary(),
+    };
+    let sidebar_rows = state.sidebar.panel_rows(24);
 
     ShellRenderState {
         show_tabs: state.app_state.show_tabs,
@@ -563,6 +708,8 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
             .map(|b| b.label.to_string())
             .collect(),
         active_sidebar_panel: active_sidebar_panel.to_string(),
+        sidebar_summary,
+        sidebar_rows,
         status_left: state.statusbar.left_text(),
         status_right: state.statusbar.right_text(),
         canvas_background: from_canvas_preference(&state.app_state.settings.appearance.canvas_background),
@@ -663,6 +810,8 @@ unsafe extern "system" fn window_proc(
                 } else {
                     let _ = state.tabs.new_blank_tab();
                 }
+
+                sync_sidebar_with_active_tab(state);
             }
 
             LRESULT(0)
@@ -835,6 +984,17 @@ unsafe extern "system" fn window_proc(
                     return LRESULT(0);
                 }
 
+                if ctrl_down && shift_down && vk == 0x42 {
+                    if let Some(tab) = state.tabs.active_tab() {
+                        let block_id = tab.cursor.primary.block_id;
+                        let snippet = block_snippet(&tab.document, block_id);
+                        let bookmark_id = state.sidebar.add_bookmark(block_id, 1, &snippet);
+                        state.app_state.status_text = format!("Bookmark added ({bookmark_id})");
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+                }
+
                 if ctrl_down && !shift_down && vk == 0x42 {
                     state.app_state.show_sidebar = !state.app_state.show_sidebar;
                     if !state.app_state.show_sidebar && state.sidebar_resizing {
@@ -903,6 +1063,7 @@ unsafe extern "system" fn window_proc(
                         .map(|t| t.title.clone())
                         .unwrap_or_else(|| "New tab".to_string());
                     state.app_state.status_text = format!("Opened {title}");
+                    sync_sidebar_with_active_tab(state);
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
                 }
@@ -915,6 +1076,7 @@ unsafe extern "system" fn window_proc(
                             .map(|t| t.title.clone())
                             .unwrap_or_else(|| "Welcome".to_string());
                         state.app_state.status_text = format!("Active tab: {active_title}");
+                        sync_sidebar_with_active_tab(state);
                     } else {
                         state.app_state.status_text = "No tab to close".to_string();
                     }
@@ -928,6 +1090,7 @@ unsafe extern "system" fn window_proc(
                     } else {
                         state.tabs.switch_next();
                     }
+                    sync_sidebar_with_active_tab(state);
                     let active_title = state
                         .tabs
                         .active_tab()
@@ -936,6 +1099,14 @@ unsafe extern "system" fn window_proc(
                     state.app_state.status_text = format!("Switched to {active_title}");
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
+                }
+
+                if !ctrl_down && state.app_state.show_sidebar {
+                    let event = UiInputEvent::KeyDown(vk);
+                    if state.sidebar.handle_input(&event) || apply_pending_sidebar_intents(state) {
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
                 }
             }
 
@@ -966,6 +1137,7 @@ unsafe extern "system" fn window_proc(
                     }
                     DropAction::Ignore => "Unsupported dropped content".to_string(),
                 };
+                sync_sidebar_with_active_tab(state);
 
                 let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
@@ -1029,6 +1201,7 @@ unsafe extern "system" fn window_proc(
                     let previous_active = state.tabs.active;
                     handled |= state.tabs.handle_input(&event);
                     if state.tabs.active != previous_active {
+                        sync_sidebar_with_active_tab(state);
                         if let Some(tab) = state.tabs.active_tab() {
                             state.app_state.status_text = format!("Switched to {}", tab.title);
                         }
@@ -1048,6 +1221,7 @@ unsafe extern "system" fn window_proc(
                 if state.app_state.show_sidebar {
                     let before = state.sidebar.active_panel;
                     handled |= state.sidebar.handle_input(&event);
+                    handled |= apply_pending_sidebar_intents(state);
                     if before != state.sidebar.active_panel {
                         state.app_state.status_text = format!(
                             "Sidebar panel: {}",

@@ -21,6 +21,7 @@ const SIDEBAR_MAX_WIDTH: f32 = 400.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 260.0;
 const COLLAPSE_DURATION_S: f32 = 0.20;
 const TOOLTIP_DELAY: Duration = Duration::from_millis(450);
+const SIDEBAR_ITEM_HEIGHT: f32 = 24.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarPanel {
@@ -53,6 +54,29 @@ pub enum SidebarAction {
     Delete,
     ShowInExplorer,
     CopyPath,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileIcon {
+    Folder,
+    Docx,
+    Pdf,
+    Text,
+    Markdown,
+    Generic,
+}
+
+impl FileIcon {
+    pub fn marker(self) -> &'static str {
+        match self {
+            FileIcon::Folder => "[DIR]",
+            FileIcon::Docx => "[DOCX]",
+            FileIcon::Pdf => "[PDF]",
+            FileIcon::Text => "[TXT]",
+            FileIcon::Markdown => "[MD]",
+            FileIcon::Generic => "[FILE]",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +167,8 @@ pub struct Sidebar {
     hover_started: Option<Instant>,
     pub show_tooltip: bool,
     next_bookmark_id: u64,
+    current_outline_block: Option<BlockId>,
+    pending_intent: Option<SidebarIntent>,
 }
 
 impl Default for Sidebar {
@@ -176,6 +202,38 @@ impl Sidebar {
             hover_started: None,
             show_tooltip: false,
             next_bookmark_id: 1,
+            current_outline_block: None,
+            pending_intent: None,
+        }
+    }
+
+    pub fn file_context_actions() -> &'static [SidebarAction] {
+        &[
+            SidebarAction::Open,
+            SidebarAction::OpenInNewTab,
+            SidebarAction::Rename,
+            SidebarAction::Delete,
+            SidebarAction::ShowInExplorer,
+            SidebarAction::CopyPath,
+        ]
+    }
+
+    pub fn file_icon_for_node(node: &FileNode) -> FileIcon {
+        if node.is_dir {
+            return FileIcon::Folder;
+        }
+        match node
+            .path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("docx") => FileIcon::Docx,
+            Some("pdf") => FileIcon::Pdf,
+            Some("txt") => FileIcon::Text,
+            Some("md") | Some("markdown") => FileIcon::Markdown,
+            _ => FileIcon::Generic,
         }
     }
 
@@ -329,6 +387,57 @@ impl Sidebar {
         self.search_results = results;
     }
 
+    pub fn search_summary(&self) -> String {
+        format!(
+            "{} results for '{}'",
+            self.search_results.len(),
+            self.search_term
+        )
+    }
+
+    pub fn set_current_outline_block(&mut self, block_id: Option<BlockId>) {
+        self.current_outline_block = block_id;
+    }
+
+    pub fn panel_rows(&self, max_rows: usize) -> Vec<String> {
+        let mut rows = Vec::new();
+        match self.active_panel {
+            SidebarPanel::Files => {
+                for item in flatten_tree_with_depth(&self.file_tree).into_iter().take(max_rows) {
+                    let indent = "  ".repeat(item.depth.min(8));
+                    let marker = Self::file_icon_for_node(item.node).marker();
+                    rows.push(format!("{indent}{marker} {}", item.node.name));
+                }
+            }
+            SidebarPanel::Outline => {
+                for item in self.outline_items.iter().take(max_rows) {
+                    let indent = "  ".repeat(item.level.saturating_sub(1) as usize);
+                    let active = if self.current_outline_block == Some(item.block_id) {
+                        "> "
+                    } else {
+                        ""
+                    };
+                    rows.push(format!("{active}{indent}{}", item.title));
+                }
+            }
+            SidebarPanel::Bookmarks => {
+                for item in self.bookmarks.iter().take(max_rows) {
+                    rows.push(format!("{} (p{})", item.name, item.page_number));
+                }
+            }
+            SidebarPanel::SearchResults => {
+                for item in self.search_results.iter().take(max_rows) {
+                    rows.push(format!("{}: {}", item.line_or_page, item.snippet));
+                }
+            }
+        }
+        rows
+    }
+
+    pub fn take_intent(&mut self) -> Option<SidebarIntent> {
+        self.pending_intent.take()
+    }
+
     pub fn keyboard_navigate(&mut self, key_vk: u32) -> Option<SidebarIntent> {
         match key_vk {
             0x26 => {
@@ -351,6 +460,23 @@ impl Sidebar {
             SidebarPanel::Outline => self.outline_items.len(),
             SidebarPanel::Bookmarks => self.bookmarks.len(),
             SidebarPanel::SearchResults => self.search_results.len(),
+        }
+    }
+
+    fn item_index_at_point(&self, point: Point) -> Option<usize> {
+        let panel = self.panel_rect();
+        if !contains(panel, point) {
+            return None;
+        }
+        let relative_y = point.y - panel.y;
+        if relative_y < 0.0 {
+            return None;
+        }
+        let index = (relative_y / SIDEBAR_ITEM_HEIGHT).floor() as usize;
+        if index < self.active_item_count() {
+            Some(index)
+        } else {
+            None
         }
     }
 
@@ -450,6 +576,18 @@ impl Sidebar {
         let idx = ((point.x - tabs_rect.x) / tab_w).floor().max(0.0) as usize;
         tabs.get(idx).copied()
     }
+
+    pub fn open_folder_for_file(&mut self, file_path: &Path) -> std::io::Result<()> {
+        let root = if file_path.is_dir() {
+            file_path.to_path_buf()
+        } else {
+            file_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| file_path.to_path_buf())
+        };
+        self.open_folder(root)
+    }
 }
 
 impl UIComponent for Sidebar {
@@ -464,20 +602,34 @@ impl UIComponent for Sidebar {
     fn handle_input(&mut self, event: &InputEvent) -> bool {
         match event {
             InputEvent::KeyDown(vk) => {
-                if *vk == 0x42 {
-                    self.toggle();
+                if let Some(intent) = self.keyboard_navigate(*vk) {
+                    self.pending_intent = Some(intent);
                     return true;
                 }
-                self.keyboard_navigate(*vk).is_some()
+                false
             }
             InputEvent::MouseDown(point) => {
                 if let Some(tab) = self.tab_hit_test(*point) {
                     self.active_panel = tab;
+                    self.selected_index = 0;
                     return true;
+                }
+                if let Some(index) = self.item_index_at_point(*point) {
+                    self.selected_index = index;
+                    self.pending_intent = self.intent_for_selected();
+                    return self.pending_intent.is_some();
                 }
                 self.hit_test(*point)
             }
-            InputEvent::MouseMove(point) => self.hit_test(*point),
+            InputEvent::MouseMove(point) => {
+                if self.active_panel == SidebarPanel::Files {
+                    let hovered = self
+                        .item_index_at_point(*point)
+                        .and_then(|index| flatten_tree(&self.file_tree).get(index).map(|node| node.path.clone()));
+                    self.hover_file_item(hovered);
+                }
+                self.hit_test(*point)
+            }
             _ => false,
         }
     }
@@ -537,6 +689,25 @@ fn flatten_tree(nodes: &[FileNode]) -> Vec<&FileNode> {
     out
 }
 
+struct FlatFileNode<'a> {
+    node: &'a FileNode,
+    depth: usize,
+}
+
+fn flatten_tree_with_depth(nodes: &[FileNode]) -> Vec<FlatFileNode<'_>> {
+    let mut out = Vec::new();
+    fn walk<'a>(out: &mut Vec<FlatFileNode<'a>>, items: &'a [FileNode], depth: usize) {
+        for node in items {
+            out.push(FlatFileNode { node, depth });
+            if node.is_dir && node.expanded {
+                walk(out, &node.children, depth + 1);
+            }
+        }
+    }
+    walk(&mut out, nodes, 0);
+    out
+}
+
 fn toggle_node_expanded(nodes: &mut [FileNode], path: &Path) -> bool {
     for node in nodes {
         if node.path == path {
@@ -577,4 +748,142 @@ fn contains(rect: Rect, point: Point) -> bool {
 
 fn map_notify(err: notify::Error) -> std::io::Error {
     std::io::Error::other(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::model::{Block, Paragraph, Run};
+
+    #[test]
+    fn width_clamps_to_sidebar_limits() {
+        let mut sidebar = Sidebar::new();
+        sidebar.set_width(120.0);
+        assert_eq!(sidebar.width, SIDEBAR_MIN_WIDTH);
+        sidebar.set_width(999.0);
+        assert_eq!(sidebar.width, SIDEBAR_MAX_WIDTH);
+    }
+
+    #[test]
+    fn tab_hit_test_selects_expected_panel() {
+        let mut sidebar = Sidebar::new();
+        sidebar.layout(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 260.0,
+                height: 600.0,
+            },
+            96.0,
+        );
+        assert_eq!(
+            sidebar.tab_hit_test(Point { x: 10.0, y: 10.0 }),
+            Some(SidebarPanel::Files)
+        );
+        assert_eq!(
+            sidebar.tab_hit_test(Point { x: 140.0, y: 10.0 }),
+            Some(SidebarPanel::Bookmarks)
+        );
+    }
+
+    #[test]
+    fn file_context_menu_actions_match_prompt() {
+        assert_eq!(
+            Sidebar::file_context_actions(),
+            &[
+                SidebarAction::Open,
+                SidebarAction::OpenInNewTab,
+                SidebarAction::Rename,
+                SidebarAction::Delete,
+                SidebarAction::ShowInExplorer,
+                SidebarAction::CopyPath,
+            ]
+        );
+    }
+
+    #[test]
+    fn file_icon_maps_common_extensions() {
+        let mk = |name: &str, is_dir: bool| FileNode {
+            path: PathBuf::from(name),
+            name: name.to_string(),
+            is_dir,
+            expanded: false,
+            children: Vec::new(),
+            size_bytes: None,
+            modified_unix_secs: None,
+        };
+        assert_eq!(Sidebar::file_icon_for_node(&mk("a.docx", false)), FileIcon::Docx);
+        assert_eq!(Sidebar::file_icon_for_node(&mk("a.pdf", false)), FileIcon::Pdf);
+        assert_eq!(Sidebar::file_icon_for_node(&mk("a.txt", false)), FileIcon::Text);
+        assert_eq!(Sidebar::file_icon_for_node(&mk("a.md", false)), FileIcon::Markdown);
+        assert_eq!(Sidebar::file_icon_for_node(&mk("folder", true)), FileIcon::Folder);
+    }
+
+    #[test]
+    fn search_summary_reports_count_and_term() {
+        let mut sidebar = Sidebar::new();
+        sidebar.set_search_results(
+            "needle",
+            vec![
+                SearchResultItem {
+                    block_id: BlockId(1),
+                    line_or_page: 1,
+                    snippet: "needle here".to_string(),
+                    start: 0,
+                    end: 6,
+                },
+                SearchResultItem {
+                    block_id: BlockId(2),
+                    line_or_page: 3,
+                    snippet: "needle there".to_string(),
+                    start: 0,
+                    end: 6,
+                },
+            ],
+        );
+        assert_eq!(sidebar.search_summary(), "2 results for 'needle'");
+    }
+
+    #[test]
+    fn bookmark_lifecycle_works() {
+        let mut sidebar = Sidebar::new();
+        let id = sidebar.add_bookmark(BlockId(7), 2, "Nearby text");
+        assert_eq!(sidebar.bookmarks.len(), 1);
+        assert!(sidebar.rename_bookmark(id, "Renamed".to_string()));
+        assert_eq!(sidebar.bookmarks[0].name, "Renamed");
+        assert!(sidebar.delete_bookmark(id));
+        assert!(sidebar.bookmarks.is_empty());
+    }
+
+    #[test]
+    fn outline_populates_from_heading_and_heading_style() {
+        let mut sidebar = Sidebar::new();
+        let mut doc = DocumentModel::default();
+        doc.content = vec![
+            Block::Heading(Heading {
+                id: BlockId(1),
+                level: 2,
+                runs: vec![Run {
+                    text: "Title".to_string(),
+                    style: Default::default(),
+                }],
+            }),
+            Block::Paragraph(Paragraph {
+                id: BlockId(2),
+                runs: vec![Run {
+                    text: "Styled heading".to_string(),
+                    style: Default::default(),
+                }],
+                alignment: Default::default(),
+                spacing: Default::default(),
+                indent: Default::default(),
+                style_id: Some("Heading3".to_string()),
+            }),
+        ];
+
+        sidebar.populate_outline(&doc);
+        assert_eq!(sidebar.outline_items.len(), 2);
+        assert_eq!(sidebar.outline_items[0].level, 2);
+        assert_eq!(sidebar.outline_items[1].level, 3);
+    }
 }

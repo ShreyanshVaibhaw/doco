@@ -62,6 +62,8 @@ pub struct ShellRenderState {
     pub active_tab: usize,
     pub toolbar_labels: Vec<String>,
     pub active_sidebar_panel: String,
+    pub sidebar_summary: String,
+    pub sidebar_rows: Vec<String>,
     pub status_left: String,
     pub status_right: String,
     pub canvas_background: BackgroundSettings,
@@ -414,14 +416,51 @@ impl D2DRenderer {
                     &text_format,
                     &D2D_RECT_F {
                         left: 14.0,
-                        top: tab_h + 34.0,
+                        top: tab_h + 30.0,
                         right: sidebar_w - 8.0,
-                        bottom: tab_h + 58.0,
+                        bottom: tab_h + 52.0,
                     },
                     &text_brush,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
+
+                let summary = shell.sidebar_summary.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &summary,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: 14.0,
+                        top: tab_h + 52.0,
+                        right: sidebar_w - 8.0,
+                        bottom: tab_h + 72.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let mut row_y = tab_h + 76.0;
+                for row in shell.sidebar_rows.iter().take(24) {
+                    let row_utf16 = row.encode_utf16().collect::<Vec<u16>>();
+                    self.d2d_context.DrawText(
+                        &row_utf16,
+                        &text_format,
+                        &D2D_RECT_F {
+                            left: 14.0,
+                            top: row_y,
+                            right: sidebar_w - 8.0,
+                            bottom: row_y + 20.0,
+                        },
+                        &text_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    row_y += 20.0;
+                    if row_y > height - status_h - 12.0 {
+                        break;
+                    }
+                }
             }
 
             let status = shell.status_text.encode_utf16().collect::<Vec<u16>>();
