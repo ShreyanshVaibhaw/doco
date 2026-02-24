@@ -32,7 +32,7 @@ windows = { version = "0.62.2", features = [
 quick-xml = "0.38"
 zip = "6.0"
 image = { version = "0.25", default-features = true }
-pdfium-render = { version = "0.8", default-features = false, optional = true }
+pdfium-render = { version = "0.8", default-features = false, features = ["pdfium_latest"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dirs = "6.0"
