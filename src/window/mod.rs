@@ -44,7 +44,7 @@ use crate::{
     document::model::{Block, DocumentModel},
     render::d2d::{D2DRenderer, ShellRenderState},
     settings::schema::Settings,
-    theme::{Theme, ThemeManager},
+    theme::{Theme, ThemeManager, backgrounds::from_canvas_preference},
     ui::{
         InputEvent as UiInputEvent,
         Point as UiPoint,
@@ -415,6 +415,7 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         active_sidebar_panel: active_sidebar_panel.to_string(),
         status_left: state.statusbar.left_text(),
         status_right: state.statusbar.right_text(),
+        canvas_background: from_canvas_preference(&state.app_state.settings.appearance.canvas_background),
     }
 }
 

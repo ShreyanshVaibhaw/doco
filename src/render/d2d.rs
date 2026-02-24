@@ -1,5 +1,5 @@
-use std::mem::ManuallyDrop;
-use std::time::Instant;
+use std::{mem::ManuallyDrop, path::Path};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use windows::{
     Win32::{
@@ -40,7 +40,10 @@ use windows_numerics::Vector2;
 
 use crate::{
     render::perf::{DebugPerformancePanel, query_process_working_set_bytes},
-    theme::Theme,
+    theme::{
+        Theme,
+        backgrounds::{BackgroundKind, BackgroundSettings, PatternStyle, preset_by_id},
+    },
 };
 
 const D2DERR_RECREATE_TARGET: HRESULT = HRESULT(0x8899000C_u32 as i32);
@@ -60,6 +63,7 @@ pub struct ShellRenderState {
     pub active_sidebar_panel: String,
     pub status_left: String,
     pub status_right: String,
+    pub canvas_background: BackgroundSettings,
 }
 
 pub struct D2DRenderer {
@@ -325,7 +329,6 @@ impl D2DRenderer {
             let tab_brush = self.create_brush(self.theme.surface_secondary.as_d2d())?;
             let side_brush = self.create_brush(self.theme.surface_primary.as_d2d())?;
             let tool_brush = self.create_brush(self.theme.surface_secondary.as_d2d())?;
-            let canvas_brush = self.create_brush(self.theme.canvas_bg.as_d2d())?;
             let status_brush = self.create_brush(self.theme.surface_primary.as_d2d())?;
 
             if tab_h > 0.0 {
@@ -337,7 +340,7 @@ impl D2DRenderer {
             if toolbar_h > 0.0 {
                 self.d2d_context.FillRectangle(&toolbar_rect, &tool_brush);
             }
-            self.d2d_context.FillRectangle(&canvas_rect, &canvas_brush);
+            self.draw_canvas_background(canvas_rect, &shell.canvas_background)?;
             if status_h > 0.0 {
                 self.d2d_context.FillRectangle(&status_rect, &status_brush);
             }
@@ -558,6 +561,292 @@ impl D2DRenderer {
         }
 
         Ok(())
+    }
+
+    fn draw_canvas_background(&self, rect: D2D_RECT_F, settings: &BackgroundSettings) -> Result<()> {
+        match &settings.kind {
+            BackgroundKind::Solid { color } => self.fill_rect(rect, *color),
+            BackgroundKind::Gradient { start, end, angle_degrees } => {
+                self.fill_gradient(rect, *start, *end, *angle_degrees)
+            }
+            BackgroundKind::Pattern {
+                style,
+                foreground,
+                background,
+                scale,
+            } => self.fill_pattern(rect, style.clone(), *foreground, *background, *scale),
+            BackgroundKind::Image {
+                path,
+                mode,
+                blur_px: _,
+                opacity,
+            } => {
+                self.fill_rect(rect, self.theme.canvas_bg)?;
+                let overlay = self.create_brush(
+                    windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: (1.0 - opacity.clamp(0.0, 1.0)).clamp(0.0, 1.0) * 0.35,
+                    },
+                )?;
+                unsafe {
+                    self.d2d_context.FillRectangle(&rect, &overlay);
+                }
+
+                let label = Path::new(path)
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("custom image");
+                let text = format!("Image background ({mode:?}): {label}");
+                self.draw_canvas_label(rect, &text)
+            }
+            BackgroundKind::AnimatedGradient { colors, speed } => {
+                if colors.len() < 2 {
+                    return self.fill_rect(rect, self.theme.canvas_bg);
+                }
+                let now_s = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs_f32())
+                    .unwrap_or(0.0);
+                let cycle = (now_s * speed.max(0.05)) % colors.len() as f32;
+                let idx = cycle.floor() as usize;
+                let next = (idx + 1) % colors.len();
+                let t = cycle - idx as f32;
+                let start = Self::lerp_color(colors[idx], colors[next], t);
+                let end = Self::lerp_color(colors[next], colors[(next + 1) % colors.len()], t);
+                self.fill_gradient(rect, start, end, 18.0)
+            }
+            BackgroundKind::Preset(id) => {
+                let resolved = preset_by_id(id);
+                self.draw_canvas_background(rect, &resolved)
+            }
+        }
+    }
+
+    fn fill_rect(&self, rect: D2D_RECT_F, color: crate::ui::Color) -> Result<()> {
+        let brush = self.create_brush(color.as_d2d())?;
+        unsafe {
+            self.d2d_context.FillRectangle(&rect, &brush);
+        }
+        Ok(())
+    }
+
+    fn fill_gradient(
+        &self,
+        rect: D2D_RECT_F,
+        start: crate::ui::Color,
+        end: crate::ui::Color,
+        angle_degrees: f32,
+    ) -> Result<()> {
+        let stripes = 64usize;
+        let width = (rect.right - rect.left).max(1.0);
+        let angle_radians = angle_degrees.to_radians();
+        let dx = angle_radians.cos();
+        let dy = angle_radians.sin();
+        for i in 0..stripes {
+            let t0 = i as f32 / stripes as f32;
+            let t1 = (i + 1) as f32 / stripes as f32;
+            let mid = (t0 + t1) * 0.5;
+            let color = Self::lerp_color(start, end, mid);
+            let brush = self.create_brush(color.as_d2d())?;
+            let x0 = rect.left + t0 * width;
+            let x1 = rect.left + t1 * width;
+            let tilt = dy * 14.0;
+            let skew = dx * 6.0;
+            let stripe = D2D_RECT_F {
+                left: x0 - skew,
+                top: rect.top - tilt,
+                right: x1 + skew,
+                bottom: rect.bottom + tilt,
+            };
+            unsafe {
+                self.d2d_context.FillRectangle(&stripe, &brush);
+            }
+        }
+        Ok(())
+    }
+
+    fn fill_pattern(
+        &self,
+        rect: D2D_RECT_F,
+        style: PatternStyle,
+        foreground: crate::ui::Color,
+        background: crate::ui::Color,
+        scale: f32,
+    ) -> Result<()> {
+        self.fill_rect(rect, background)?;
+        let brush = self.create_brush(foreground.as_d2d())?;
+        let step = (10.0 * scale.max(0.25)).clamp(4.0, 48.0);
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+
+        unsafe {
+            match style {
+                PatternStyle::Dots => {
+                    let size = (1.8 * scale.max(0.5)).clamp(1.2, 4.0);
+                    let mut y = rect.top;
+                    while y <= rect.bottom {
+                        let mut x = rect.left;
+                        while x <= rect.right {
+                            let dot = D2D_RECT_F {
+                                left: x,
+                                top: y,
+                                right: x + size,
+                                bottom: y + size,
+                            };
+                            self.d2d_context.FillRectangle(&dot, &brush);
+                            x += step;
+                        }
+                        y += step;
+                    }
+                }
+                PatternStyle::LinesHorizontal => {
+                    let mut y = rect.top;
+                    while y <= rect.bottom {
+                        self.d2d_context.DrawLine(
+                            Vector2 { X: rect.left, Y: y },
+                            Vector2 { X: rect.right, Y: y },
+                            &brush,
+                            1.0,
+                            None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                        );
+                        y += step;
+                    }
+                }
+                PatternStyle::LinesVertical => {
+                    let mut x = rect.left;
+                    while x <= rect.right {
+                        self.d2d_context.DrawLine(
+                            Vector2 { X: x, Y: rect.top },
+                            Vector2 { X: x, Y: rect.bottom },
+                            &brush,
+                            1.0,
+                            None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                        );
+                        x += step;
+                    }
+                }
+                PatternStyle::LinesDiagonal | PatternStyle::CrossHatch | PatternStyle::GraphPaper => {
+                    if matches!(style, PatternStyle::GraphPaper) {
+                        let mut y = rect.top;
+                        while y <= rect.bottom {
+                            self.d2d_context.DrawLine(
+                                Vector2 { X: rect.left, Y: y },
+                                Vector2 { X: rect.right, Y: y },
+                                &brush,
+                                1.0,
+                                None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                            );
+                            y += step;
+                        }
+                        let mut x = rect.left;
+                        while x <= rect.right {
+                            self.d2d_context.DrawLine(
+                                Vector2 { X: x, Y: rect.top },
+                                Vector2 { X: x, Y: rect.bottom },
+                                &brush,
+                                1.0,
+                                None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                            );
+                            x += step;
+                        }
+                    } else {
+                        let mut offset = -height;
+                        while offset <= width {
+                            self.d2d_context.DrawLine(
+                                Vector2 {
+                                    X: rect.left + offset,
+                                    Y: rect.top,
+                                },
+                                Vector2 {
+                                    X: rect.left + offset + height,
+                                    Y: rect.bottom,
+                                },
+                                &brush,
+                                1.0,
+                                None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                            );
+                            if matches!(style, PatternStyle::CrossHatch) {
+                                self.d2d_context.DrawLine(
+                                    Vector2 {
+                                        X: rect.left + offset + height,
+                                        Y: rect.top,
+                                    },
+                                    Vector2 {
+                                        X: rect.left + offset,
+                                        Y: rect.bottom,
+                                    },
+                                    &brush,
+                                    1.0,
+                                    None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                                );
+                            }
+                            offset += step;
+                        }
+                    }
+                }
+                PatternStyle::Noise => {
+                    let size = (1.0 * scale.max(0.5)).clamp(1.0, 2.2);
+                    let cell = step.max(4.0);
+                    let mut yi = 0u32;
+                    let mut y = rect.top;
+                    while y <= rect.bottom {
+                        let mut xi = 0u32;
+                        let mut x = rect.left;
+                        while x <= rect.right {
+                            let hash = ((xi.wrapping_mul(73856093)) ^ (yi.wrapping_mul(19349663))) & 0xFF;
+                            if hash < 84 {
+                                let dot = D2D_RECT_F {
+                                    left: x,
+                                    top: y,
+                                    right: x + size,
+                                    bottom: y + size,
+                                };
+                                self.d2d_context.FillRectangle(&dot, &brush);
+                            }
+                            x += cell;
+                            xi = xi.wrapping_add(1);
+                        }
+                        y += cell;
+                        yi = yi.wrapping_add(1);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_canvas_label(&self, rect: D2D_RECT_F, label: &str) -> Result<()> {
+        let text = label.encode_utf16().collect::<Vec<u16>>();
+        let text_format = self.create_text_format()?;
+        let text_brush = self.create_brush(self.theme.text_secondary.as_d2d())?;
+        unsafe {
+            self.d2d_context.DrawText(
+                &text,
+                &text_format,
+                &D2D_RECT_F {
+                    left: rect.left + 12.0,
+                    top: rect.top + 12.0,
+                    right: rect.right - 12.0,
+                    bottom: rect.top + 38.0,
+                },
+                &text_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        Ok(())
+    }
+
+    fn lerp_color(a: crate::ui::Color, b: crate::ui::Color, t: f32) -> crate::ui::Color {
+        let tt = t.clamp(0.0, 1.0);
+        crate::ui::Color::rgba(
+            a.r + (b.r - a.r) * tt,
+            a.g + (b.g - a.g) * tt,
+            a.b + (b.b - a.b) * tt,
+            a.a + (b.a - a.a) * tt,
+        )
     }
 
     fn create_text_format(&self) -> Result<IDWriteTextFormat> {
