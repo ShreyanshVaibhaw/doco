@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+      Id="*"
+      Name="Doco"
+      Language="1033"
+      Version="0.1.0"
+      Manufacturer="Doco Project"
+      UpgradeCode="E6D47D3D-F20C-40AD-A0F7-8D0F5C7D2F8A">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Doco is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="ProductFeature" Title="Doco" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+  </Product>
+
+  <Fragment>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Doco" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ProgramMenuDir" Name="Doco" />
+      </Directory>
+      <Directory Id="DesktopFolder" />
+    </Directory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="DocoExe" Guid="9A7AFD66-1B84-447A-91D5-307A7A23F5BB">
+        <File Source="..\..\target\release\doco.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="PdfiumDll" Guid="442A6A0A-84CE-4282-B355-65FA86EF2D2E">
+        <File Source="..\..\pdfium.dll" />
+      </Component>
+
+      <Component Id="ProgramMenuShortcut" Guid="0FE44A42-B150-4A71-B524-0450FE8A4305" Directory="ProgramMenuDir">
+        <Shortcut Id="ApplicationStartMenuShortcut"
+                  Name="Doco"
+                  Description="Doco"
+                  Target="[INSTALLFOLDER]doco.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="ProgramMenuDir" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\Doco" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>
+
