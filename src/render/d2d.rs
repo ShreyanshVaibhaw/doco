@@ -64,6 +64,10 @@ pub struct ShellRenderState {
     pub active_sidebar_panel: String,
     pub sidebar_summary: String,
     pub sidebar_rows: Vec<String>,
+    pub command_palette_open: bool,
+    pub command_palette_query: String,
+    pub command_palette_results: Vec<String>,
+    pub command_palette_selected: usize,
     pub status_left: String,
     pub status_right: String,
     pub canvas_background: BackgroundSettings,
@@ -460,6 +464,82 @@ impl D2DRenderer {
                     if row_y > height - status_h - 12.0 {
                         break;
                     }
+                }
+            }
+
+            if shell.command_palette_open {
+                let palette_w = 600.0_f32.min((width - 24.0).max(320.0));
+                let palette_h = 400.0_f32.min((height - 28.0).max(120.0));
+                let palette_x = (width - palette_w) * 0.5;
+                let palette_y = 20.0;
+                let palette_rect = D2D_RECT_F {
+                    left: palette_x,
+                    top: palette_y,
+                    right: palette_x + palette_w,
+                    bottom: palette_y + palette_h,
+                };
+
+                let mut overlay = self.theme.surface_primary.as_d2d();
+                overlay.a = 0.94;
+                let overlay_brush = self.create_brush(overlay)?;
+                self.d2d_context.FillRectangle(&palette_rect, &overlay_brush);
+
+                let border_brush = self.create_brush(self.theme.border_default.as_d2d())?;
+                self.d2d_context.DrawRectangle(
+                    &palette_rect,
+                    &border_brush,
+                    1.0,
+                    None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                );
+
+                let query_text = format!("> {}", shell.command_palette_query);
+                let query_utf16 = query_text.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &query_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: palette_x + 14.0,
+                        top: palette_y + 10.0,
+                        right: palette_x + palette_w - 12.0,
+                        bottom: palette_y + 36.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let mut row_y = palette_y + 44.0;
+                for (idx, row) in shell.command_palette_results.iter().enumerate() {
+                    if row_y + 24.0 > palette_y + palette_h - 8.0 {
+                        break;
+                    }
+                    if idx == shell.command_palette_selected {
+                        let highlight_brush = self.create_brush(self.theme.surface_hover.as_d2d())?;
+                        self.d2d_context.FillRectangle(
+                            &D2D_RECT_F {
+                                left: palette_x + 8.0,
+                                top: row_y - 1.0,
+                                right: palette_x + palette_w - 8.0,
+                                bottom: row_y + 21.0,
+                            },
+                            &highlight_brush,
+                        );
+                    }
+                    let row_utf16 = row.encode_utf16().collect::<Vec<u16>>();
+                    self.d2d_context.DrawText(
+                        &row_utf16,
+                        &text_format,
+                        &D2D_RECT_F {
+                            left: palette_x + 14.0,
+                            top: row_y,
+                            right: palette_x + palette_w - 12.0,
+                            bottom: row_y + 20.0,
+                        },
+                        &text_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    row_y += 22.0;
                 }
             }
 

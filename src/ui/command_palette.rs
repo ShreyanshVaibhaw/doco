@@ -237,6 +237,15 @@ impl CommandPalette {
         self.commands.get(index)
     }
 
+    pub fn result_labels(&self, max: usize) -> Vec<String> {
+        self.results
+            .iter()
+            .take(max)
+            .filter_map(|hit| self.command(hit.command_index))
+            .map(|cmd| cmd.label.to_string())
+            .collect()
+    }
+
     fn load_recent_or_all(&mut self, app_state: Option<&AppState>) {
         if !self.recent_ids.is_empty() {
             for recent_id in &self.recent_ids {
@@ -463,6 +472,12 @@ fn default_command_registry() -> Vec<Command> {
     push("view.zoom_in", "Zoom In", "View", Some("Ctrl++"), Box::new(|state| {
         state.status_text = "Zoom in".to_string();
     }));
+    push("view.font_size_increase", "Font Size Increase", "View", Some("Ctrl+Shift+>"), Box::new(|state| {
+        state.status_text = "Font size increased".to_string();
+    }));
+    push("view.font_size_decrease", "Font Size Decrease", "View", Some("Ctrl+Shift+<"), Box::new(|state| {
+        state.status_text = "Font size decreased".to_string();
+    }));
     push("view.zoom_out", "Zoom Out", "View", Some("Ctrl+-"), Box::new(|state| {
         state.status_text = "Zoom out".to_string();
     }));
@@ -485,15 +500,139 @@ fn default_command_registry() -> Vec<Command> {
     push("view.debug_panel", "Toggle Debug Panel", "View", Some("Ctrl+Shift+D"), Box::new(|state| {
         state.show_debug_panel = !state.show_debug_panel;
     }));
+    push("view.fit_width", "Fit Width", "View", None, Box::new(|state| {
+        state.status_text = "Fit width".to_string();
+    }));
+    push("view.fit_page", "Fit Page", "View", None, Box::new(|state| {
+        state.status_text = "Fit page".to_string();
+    }));
+    push("view.single_page", "Single Page Mode", "View", None, Box::new(|state| {
+        state.status_text = "Single page mode".to_string();
+    }));
+    push("view.continuous", "Continuous Mode", "View", None, Box::new(|state| {
+        state.status_text = "Continuous mode".to_string();
+    }));
+    push("view.read_mode", "Read Mode", "View", None, Box::new(|state| {
+        state.status_text = "Read mode".to_string();
+    }));
+    push("view.fullscreen", "Toggle Full Screen", "View", Some("F11"), Box::new(|state| {
+        state.status_text = "Toggle fullscreen".to_string();
+    }));
+    push("view.focus_mode", "Toggle Focus Mode", "View", None, Box::new(|state| {
+        state.status_text = "Toggle focus mode".to_string();
+    }));
 
     push("theme.switch", "Switch Theme", "Theme", None, Box::new(|state| {
         state.status_text = "Switch theme".to_string();
+    }));
+    push("theme.toggle_dark_mode", "Toggle Dark Mode", "Theme", None, Box::new(|state| {
+        state.status_text = "Toggle dark mode".to_string();
     }));
     push("background.change", "Change Background", "Background", None, Box::new(|state| {
         state.status_text = "Change background".to_string();
     }));
     push("document.word_count", "Word Count", "Document", None, Box::new(|state| {
         state.status_text = "Word count".to_string();
+    }));
+    push("document.properties", "Document Properties", "Document", None, Box::new(|state| {
+        state.status_text = "Document properties".to_string();
+    }));
+    push("document.goto_page", "Go to Page", "Document", None, Box::new(|state| {
+        state.status_text = "Go to page".to_string();
+    }));
+
+    push("file.open_folder", "Open Folder", "File", Some("Ctrl+K Ctrl+O"), Box::new(|state| {
+        state.status_text = "Open folder".to_string();
+    }));
+    push("file.close_tab", "Close Tab", "File", Some("Ctrl+W"), Box::new(|state| {
+        state.status_text = "Close tab".to_string();
+    }));
+    push("file.close_window", "Close Window", "File", Some("Alt+F4"), Box::new(|state| {
+        state.status_text = "Close window".to_string();
+    }));
+
+    push("edit.cut", "Cut", "Edit", Some("Ctrl+X"), Box::new(|state| {
+        state.status_text = "Cut".to_string();
+    }));
+    push("edit.copy", "Copy", "Edit", Some("Ctrl+C"), Box::new(|state| {
+        state.status_text = "Copy".to_string();
+    }));
+    push("edit.paste", "Paste", "Edit", Some("Ctrl+V"), Box::new(|state| {
+        state.status_text = "Paste".to_string();
+    }));
+    push("edit.paste_plain", "Paste Plain", "Edit", Some("Ctrl+Shift+V"), Box::new(|state| {
+        state.status_text = "Paste plain".to_string();
+    }));
+    push("edit.select_all", "Select All", "Edit", Some("Ctrl+A"), Box::new(|state| {
+        state.status_text = "Select all".to_string();
+    }));
+
+    push("format.strikethrough", "Strikethrough", "Format", Some("Ctrl+Shift+X"), Box::new(|state| {
+        state.status_text = "Strikethrough".to_string();
+    }));
+    push("format.superscript", "Superscript", "Format", Some("Ctrl+Shift+="), Box::new(|state| {
+        state.status_text = "Superscript".to_string();
+    }));
+    push("format.subscript", "Subscript", "Format", Some("Ctrl+="), Box::new(|state| {
+        state.status_text = "Subscript".to_string();
+    }));
+    push("format.heading_2", "Heading 2", "Format", None, Box::new(|state| {
+        state.status_text = "Heading 2".to_string();
+    }));
+    push("format.heading_3", "Heading 3", "Format", None, Box::new(|state| {
+        state.status_text = "Heading 3".to_string();
+    }));
+    push("format.heading_4", "Heading 4", "Format", None, Box::new(|state| {
+        state.status_text = "Heading 4".to_string();
+    }));
+    push("format.heading_5", "Heading 5", "Format", None, Box::new(|state| {
+        state.status_text = "Heading 5".to_string();
+    }));
+    push("format.heading_6", "Heading 6", "Format", None, Box::new(|state| {
+        state.status_text = "Heading 6".to_string();
+    }));
+    push("format.normal_text", "Normal Text", "Format", None, Box::new(|state| {
+        state.status_text = "Normal text".to_string();
+    }));
+    push("format.bullet_list", "Bullet List", "Format", None, Box::new(|state| {
+        state.status_text = "Bullet list".to_string();
+    }));
+    push("format.numbered_list", "Numbered List", "Format", None, Box::new(|state| {
+        state.status_text = "Numbered list".to_string();
+    }));
+    push("format.increase_indent", "Increase Indent", "Format", None, Box::new(|state| {
+        state.status_text = "Increase indent".to_string();
+    }));
+    push("format.decrease_indent", "Decrease Indent", "Format", None, Box::new(|state| {
+        state.status_text = "Decrease indent".to_string();
+    }));
+    push("format.align_left", "Align Left", "Format", None, Box::new(|state| {
+        state.status_text = "Align left".to_string();
+    }));
+    push("format.align_center", "Align Center", "Format", None, Box::new(|state| {
+        state.status_text = "Align center".to_string();
+    }));
+    push("format.align_right", "Align Right", "Format", None, Box::new(|state| {
+        state.status_text = "Align right".to_string();
+    }));
+    push("format.align_justify", "Align Justify", "Format", None, Box::new(|state| {
+        state.status_text = "Align justify".to_string();
+    }));
+    push("format.line_spacing", "Line Spacing", "Format", None, Box::new(|state| {
+        state.status_text = "Line spacing".to_string();
+    }));
+
+    push("insert.horizontal_rule", "Horizontal Rule", "Insert", None, Box::new(|state| {
+        state.status_text = "Horizontal rule".to_string();
+    }));
+    push("insert.page_break", "Page Break", "Insert", None, Box::new(|state| {
+        state.status_text = "Page break".to_string();
+    }));
+    push("insert.special_char", "Special Character", "Insert", None, Box::new(|state| {
+        state.status_text = "Special character".to_string();
+    }));
+    push("insert.datetime", "Date/Time", "Insert", None, Box::new(|state| {
+        state.status_text = "Date/time".to_string();
     }));
 
     commands
@@ -560,4 +699,48 @@ fn contains(rect: Rect, point: Point) -> bool {
         && point.x <= rect.x + rect.width
         && point.y >= rect.y
         && point.y <= rect.y + rect.height
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quick_action_mode_prefixes_match_prompt() {
+        assert_eq!(QuickActionMode::from_query(">save"), QuickActionMode::Command);
+        assert_eq!(QuickActionMode::from_query("#h1"), QuickActionMode::GoToHeading);
+        assert_eq!(QuickActionMode::from_query(":12"), QuickActionMode::GoToLineOrPage);
+        assert_eq!(QuickActionMode::from_query("@intro"), QuickActionMode::GoToBookmark);
+        assert_eq!(QuickActionMode::from_query("needle"), QuickActionMode::SearchDocument);
+    }
+
+    #[test]
+    fn fuzzy_search_matches_font_size_increase() {
+        let mut palette = CommandPalette::new();
+        palette.set_query(">fsi");
+        let labels = palette.result_labels(8);
+        assert!(labels.iter().any(|label| label == "Font Size Increase"));
+    }
+
+    #[test]
+    fn empty_query_prefers_recent_commands() {
+        let mut palette = CommandPalette::new();
+        let mut app_state = AppState::default();
+        palette.set_query(">save");
+        assert!(palette.execute_selected(&mut app_state));
+        palette.open();
+        let first = palette
+            .results()
+            .first()
+            .and_then(|hit| palette.command(hit.command_index))
+            .map(|cmd| cmd.id);
+        assert_eq!(first, Some("file.save"));
+    }
+
+    #[test]
+    fn group_headers_exist_when_results_span_categories() {
+        let mut palette = CommandPalette::new();
+        palette.set_query(">toggle");
+        assert!(!palette.grouped_result_headers.is_empty());
+    }
 }

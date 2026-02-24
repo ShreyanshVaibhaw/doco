@@ -28,7 +28,7 @@ use windows::{
                 GetSystemMetrics, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG, PostQuitMessage,
                 RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
                 SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-                WINDOW_EX_STYLE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_KEYDOWN,
+                WINDOW_EX_STYLE, WM_CHAR, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_KEYDOWN,
                 WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
                 WM_SETTINGCHANGE, WM_SIZE,
                 WNDCLASSEXW,
@@ -54,6 +54,7 @@ use crate::{
     settings::schema::Settings,
     theme::{Theme, ThemeManager, backgrounds::{BackgroundKind, from_canvas_preference}},
     ui::{
+        command_palette::CommandPalette,
         InputEvent as UiInputEvent,
         Point as UiPoint,
         Rect as UiRect,
@@ -93,6 +94,7 @@ struct WindowState {
     app_state: AppState,
     tabs: TabsBar,
     sidebar: Sidebar,
+    command_palette: CommandPalette,
     toolbar: Toolbar,
     statusbar: StatusBar,
     last_ui_tick: Instant,
@@ -160,6 +162,7 @@ impl AppWindow {
             app_state,
             tabs: TabsBar::default(),
             sidebar: Sidebar::default(),
+            command_palette: CommandPalette::default(),
             toolbar: Toolbar::default(),
             statusbar: StatusBar::default(),
             last_ui_tick: Instant::now(),
@@ -457,6 +460,15 @@ fn relayout_shell(state: &mut WindowState, width: f32, height: f32) {
         },
         state.dpi,
     );
+    state.command_palette.layout(
+        UiRect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        },
+        state.dpi,
+    );
 
     let (canvas_w, canvas_h) = canvas_viewport_size(state, width, height);
     if let Some(tab) = state.tabs.active_tab_mut() {
@@ -689,6 +701,10 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         SidebarPanel::SearchResults => state.sidebar.search_summary(),
     };
     let sidebar_rows = state.sidebar.panel_rows(24);
+    let command_palette_open = state.command_palette.is_open();
+    let command_palette_query = state.command_palette.query.clone();
+    let command_palette_selected = state.command_palette.selected;
+    let command_palette_results = state.command_palette.result_labels(8);
 
     ShellRenderState {
         show_tabs: state.app_state.show_tabs,
@@ -710,6 +726,10 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         active_sidebar_panel: active_sidebar_panel.to_string(),
         sidebar_summary,
         sidebar_rows,
+        command_palette_open,
+        command_palette_query,
+        command_palette_results,
+        command_palette_selected,
         status_left: state.statusbar.left_text(),
         status_right: state.statusbar.right_text(),
         canvas_background: from_canvas_preference(&state.app_state.settings.appearance.canvas_background),
@@ -887,6 +907,7 @@ unsafe extern "system" fn window_proc(
                 let dt = (now - state.last_ui_tick).as_secs_f32().clamp(0.0, 0.25);
                 state.last_ui_tick = now;
                 state.sidebar.tick(dt);
+                state.command_palette.tick(dt);
                 let mut needs_next_frame = false;
                 if let Some(tab) = state.tabs.active_tab_mut() {
                     needs_next_frame |= tab.canvas.update(dt);
@@ -964,6 +985,26 @@ unsafe extern "system" fn window_proc(
                     };
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
+                }
+
+                if (ctrl_down && shift_down && vk == 0x50) || vk == 0x70 {
+                    state.command_palette.open();
+                    state.command_palette.refresh_results(Some(&state.app_state));
+                    state.app_state.status_text = "Command palette".to_string();
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+
+                if state.command_palette.is_open() {
+                    let event = UiInputEvent::KeyDown(vk);
+                    let mut handled = state.command_palette.handle_input(&event);
+                    if vk == 0x0D {
+                        handled |= state.command_palette.execute_selected(&mut state.app_state);
+                    }
+                    if handled {
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
                 }
 
                 if ctrl_down && !shift_down && vk == 0x50 {
@@ -1112,6 +1153,23 @@ unsafe extern "system" fn window_proc(
 
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
+        WM_CHAR => {
+            if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
+                if state.command_palette.is_open() {
+                    let code = wparam.0 as u32;
+                    if let Some(ch) = char::from_u32(code) {
+                        if !ch.is_control() {
+                            let event = UiInputEvent::Char(ch);
+                            if state.command_palette.handle_input(&event) {
+                                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                                return LRESULT(0);
+                            }
+                        }
+                    }
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
         WM_DROPFILES => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
                 let payload = unsafe { extract_drop_payload(HDROP(wparam.0 as *mut c_void)) };
@@ -1184,6 +1242,13 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONDOWN => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
                 let point = point_from_lparam(lparam);
+                if state.command_palette.is_open() {
+                    let event = UiInputEvent::MouseDown(point);
+                    if state.command_palette.handle_input(&event) {
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+                }
                 if sidebar_splitter_hit_test(state, point) {
                     state.sidebar_resizing = true;
                     state.sidebar.resizing = true;
@@ -1211,6 +1276,10 @@ unsafe extern "system" fn window_proc(
                 if state.app_state.show_toolbar {
                     if let Some(index) = state.toolbar.hit_button(point) {
                         if let Some(action) = state.toolbar.invoke(index) {
+                            if action == ToolbarAction::CommandPalette {
+                                state.command_palette.open();
+                                state.command_palette.refresh_results(Some(&state.app_state));
+                            }
                             state.app_state.status_text =
                                 format!("Toolbar action: {}", toolbar_action_text(action));
                         }
