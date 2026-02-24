@@ -65,6 +65,18 @@ impl UndoStack {
         Some(entry)
     }
 
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    pub fn redo_len(&self) -> usize {
+        self.redo.len()
+    }
+
+    pub fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+
     fn try_coalesce(&mut self, next: &mut UndoEntry) -> bool {
         let Some(last) = self.undo.back_mut() else {
             return false;
@@ -134,4 +146,80 @@ impl Default for UndoStack {
 
 fn is_coalescable_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::model::BlockId;
+
+    fn insert_cmd(text: &str, offset: usize) -> EditCommand {
+        EditCommand::InsertText {
+            block_id: BlockId(1),
+            offset,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn coalesces_typing_but_breaks_on_space() {
+        let now = Instant::now();
+        let mut stack = UndoStack::default();
+
+        stack.push(UndoEntry {
+            command: insert_cmd("h", 0),
+            inverse: EditCommand::DeleteText {
+                block_id: BlockId(1),
+                start: 0,
+                end: 1,
+            },
+            bytes: 1,
+            timestamp: now,
+        });
+        stack.push(UndoEntry {
+            command: insert_cmd("i", 1),
+            inverse: EditCommand::DeleteText {
+                block_id: BlockId(1),
+                start: 1,
+                end: 2,
+            },
+            bytes: 1,
+            timestamp: now,
+        });
+        assert_eq!(stack.undo_len(), 1);
+
+        stack.push(UndoEntry {
+            command: insert_cmd(" ", 2),
+            inverse: EditCommand::DeleteText {
+                block_id: BlockId(1),
+                start: 2,
+                end: 3,
+            },
+            bytes: 1,
+            timestamp: now,
+        });
+        assert_eq!(stack.undo_len(), 2);
+    }
+
+    #[test]
+    fn enforces_memory_and_step_limits() {
+        let mut stack = UndoStack::with_limits(32, 64 * 1024);
+        let now = Instant::now();
+
+        for i in 0..200 {
+            stack.push(UndoEntry {
+                command: insert_cmd("abcdefghijklmnopqrstuvwxyz", i),
+                inverse: EditCommand::DeleteText {
+                    block_id: BlockId(1),
+                    start: i,
+                    end: i + 26,
+                },
+                bytes: 4096,
+                timestamp: now,
+            });
+        }
+
+        assert!(stack.undo_len() <= 32);
+        assert!(stack.used_bytes() <= 64 * 1024);
+    }
 }

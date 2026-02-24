@@ -1,4 +1,5 @@
 use crate::document::model::{
+    Block,
     BlockId,
     ListType,
     Paragraph,
@@ -34,6 +35,10 @@ pub enum EditCommand {
     },
     InsertBlock {
         at_index: usize,
+    },
+    RestoreBlock {
+        at_index: usize,
+        block: Block,
     },
     DeleteBlock {
         block_id: BlockId,
@@ -134,8 +139,6 @@ pub fn shortcut_from_vk(ctrl: bool, shift: bool, vk: u32) -> Option<Shortcut> {
         (false, 0x49) => Some(Shortcut::Italic),
         (false, 0x55) => Some(Shortcut::Underline),
         (true, 0x58) => Some(Shortcut::Strikethrough),
-        (true, 0xBB) => Some(Shortcut::Superscript),
-        (false, 0xBB) => Some(Shortcut::Subscript),
         (false, 0xDC) => Some(Shortcut::ClearFormatting),
         (false, 0x4C) => Some(Shortcut::AlignLeft),
         (false, 0x45) => Some(Shortcut::AlignCenter),
@@ -155,11 +158,71 @@ pub fn shortcut_from_vk(ctrl: bool, shift: bool, vk: u32) -> Option<Shortcut> {
         (false, 0x48) => Some(Shortcut::Replace),
         (false, 0x50) => Some(Shortcut::Print),
         (true, 0x50) => Some(Shortcut::CommandPalette),
-        (false, 0x6B) => Some(Shortcut::ZoomIn),
+        (false, 0x6B) | (true, 0xBB) => Some(Shortcut::ZoomIn),
         (false, 0x6D) | (false, 0xBD) => Some(Shortcut::ZoomOut),
         (false, 0x30) => Some(Shortcut::ZoomReset),
         (false, 0x41) => Some(Shortcut::SelectAll),
         _ => None,
+    }
+}
+
+pub fn insert_text(block_id: BlockId, offset: usize, text: impl Into<String>) -> EditCommand {
+    EditCommand::InsertText {
+        block_id,
+        offset,
+        text: text.into(),
+    }
+}
+
+pub fn backspace(block_id: BlockId, cursor_offset: usize) -> Option<EditCommand> {
+    if cursor_offset == 0 {
+        return None;
+    }
+    Some(EditCommand::DeleteText {
+        block_id,
+        start: cursor_offset.saturating_sub(1),
+        end: cursor_offset,
+    })
+}
+
+pub fn delete_forward(block_id: BlockId, cursor_offset: usize) -> EditCommand {
+    EditCommand::DeleteText {
+        block_id,
+        start: cursor_offset,
+        end: cursor_offset + 1,
+    }
+}
+
+pub fn split_paragraph(block_id: BlockId, offset: usize) -> EditCommand {
+    EditCommand::SplitBlock { block_id, offset }
+}
+
+pub fn tab(block_id: BlockId, offset: usize, as_indent: bool) -> EditCommand {
+    if as_indent {
+        EditCommand::FormatParagraph {
+            block_id,
+            op: ParagraphFormatOp::IndentDelta(24.0),
+        }
+    } else {
+        EditCommand::InsertText {
+            block_id,
+            offset,
+            text: "\t".to_string(),
+        }
+    }
+}
+
+pub fn format_selection(
+    block_id: BlockId,
+    start: usize,
+    end: usize,
+    style_patch: RunStylePatch,
+) -> EditCommand {
+    EditCommand::FormatRun {
+        block_id,
+        start,
+        end,
+        style_patch,
     }
 }
 
@@ -181,5 +244,33 @@ pub fn patch_toggle_underline() -> RunStylePatch {
     RunStylePatch {
         underline: Some(true),
         ..RunStylePatch::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_required_shortcuts() {
+        assert_eq!(shortcut_from_vk(true, false, 0x42), Some(Shortcut::Bold));
+        assert_eq!(shortcut_from_vk(true, false, 0x49), Some(Shortcut::Italic));
+        assert_eq!(shortcut_from_vk(true, false, 0x55), Some(Shortcut::Underline));
+        assert_eq!(shortcut_from_vk(true, false, 0x53), Some(Shortcut::Save));
+        assert_eq!(shortcut_from_vk(true, false, 0x4F), Some(Shortcut::Open));
+        assert_eq!(shortcut_from_vk(true, false, 0x4E), Some(Shortcut::New));
+        assert_eq!(shortcut_from_vk(true, false, 0x5A), Some(Shortcut::Undo));
+        assert_eq!(shortcut_from_vk(true, false, 0x59), Some(Shortcut::Redo));
+        assert_eq!(shortcut_from_vk(true, true, 0x5A), Some(Shortcut::Redo));
+        assert_eq!(shortcut_from_vk(true, false, 0x43), Some(Shortcut::Copy));
+        assert_eq!(shortcut_from_vk(true, false, 0x58), Some(Shortcut::Cut));
+        assert_eq!(shortcut_from_vk(true, false, 0x56), Some(Shortcut::Paste));
+        assert_eq!(shortcut_from_vk(true, false, 0x46), Some(Shortcut::Find));
+        assert_eq!(shortcut_from_vk(true, false, 0x48), Some(Shortcut::Replace));
+        assert_eq!(shortcut_from_vk(true, false, 0x50), Some(Shortcut::Print));
+        assert_eq!(shortcut_from_vk(true, true, 0x50), Some(Shortcut::CommandPalette));
+        assert_eq!(shortcut_from_vk(true, true, 0xBB), Some(Shortcut::ZoomIn));
+        assert_eq!(shortcut_from_vk(true, false, 0xBD), Some(Shortcut::ZoomOut));
+        assert_eq!(shortcut_from_vk(true, false, 0x30), Some(Shortcut::ZoomReset));
     }
 }
