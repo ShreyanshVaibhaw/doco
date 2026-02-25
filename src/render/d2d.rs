@@ -89,6 +89,8 @@ pub struct ShellRenderState {
     pub status_text: String,
     pub tab_titles: Vec<String>,
     pub active_tab: usize,
+    pub tab_has_overflow_left: bool,
+    pub tab_has_overflow_right: bool,
     pub toolbar_labels: Vec<String>,
     pub active_sidebar_panel: String,
     pub sidebar_summary: String,
@@ -1271,40 +1273,138 @@ impl D2DRenderer {
                 );
             }
 
-            if tab_h > 0.0 && !shell.tab_titles.is_empty() {
-                let mut x = 8.0;
-                for (idx, title) in shell.tab_titles.iter().take(8).enumerate() {
-                    let tab_w =
-                        ((width - 16.0) / shell.tab_titles.len().min(8) as f32).clamp(120.0, 220.0);
-                    let rect = D2D_RECT_F {
-                        left: x,
-                        top: 4.0,
-                        right: (x + tab_w).min(width - 8.0),
-                        bottom: tab_h - 4.0,
+            if tab_h > 0.0 {
+                let mut tabs_left = 8.0;
+                let tabs_top = 4.0;
+                let tabs_bottom = tab_h - 4.0;
+                let new_btn_rect = D2D_RECT_F {
+                    left: (width - 36.0).max(8.0),
+                    top: 6.0,
+                    right: (width - 8.0).max(20.0),
+                    bottom: tab_h - 6.0,
+                };
+
+                if shell.tab_has_overflow_left || shell.tab_has_overflow_right {
+                    let overflow_bg = self.create_brush(self.theme.surface_secondary.as_d2d())?;
+                    let overflow_text = self.create_brush(self.theme.text_secondary.as_d2d())?;
+                    let left_rect = D2D_RECT_F {
+                        left: tabs_left,
+                        top: 6.0,
+                        right: tabs_left + 24.0,
+                        bottom: tab_h - 6.0,
                     };
-                    let brush = if idx == shell.active_tab {
-                        self.create_brush(self.theme.surface_hover.as_d2d())?
-                    } else {
-                        self.create_brush(self.theme.surface_secondary.as_d2d())?
+                    let right_rect = D2D_RECT_F {
+                        left: tabs_left + 28.0,
+                        top: 6.0,
+                        right: tabs_left + 52.0,
+                        bottom: tab_h - 6.0,
                     };
-                    self.d2d_context.FillRectangle(&rect, &brush);
-                    let text = title.encode_utf16().collect::<Vec<u16>>();
+                    self.d2d_context.FillRectangle(&left_rect, &overflow_bg);
+                    self.d2d_context.FillRectangle(&right_rect, &overflow_bg);
+                    let left_arrow = if shell.tab_has_overflow_left { "<" } else { " " }
+                        .encode_utf16()
+                        .collect::<Vec<u16>>();
+                    let right_arrow = if shell.tab_has_overflow_right { ">" } else { " " }
+                        .encode_utf16()
+                        .collect::<Vec<u16>>();
                     self.d2d_context.DrawText(
-                        &text,
+                        &left_arrow,
                         &text_format,
-                        &D2D_RECT_F {
-                            left: rect.left + 10.0,
-                            top: rect.top + 6.0,
-                            right: rect.right - 6.0,
-                            bottom: rect.bottom - 4.0,
-                        },
-                        &text_brush,
+                        &left_rect,
+                        &overflow_text,
                         D2D1_DRAW_TEXT_OPTIONS_NONE,
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
-                    x += tab_w + 6.0;
-                    if x > width - 80.0 {
-                        break;
+                    self.d2d_context.DrawText(
+                        &right_arrow,
+                        &text_format,
+                        &right_rect,
+                        &overflow_text,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    tabs_left = right_rect.right + 6.0;
+                }
+
+                let new_btn_bg = self.create_brush(self.theme.surface_secondary.as_d2d())?;
+                self.d2d_context.FillRectangle(&new_btn_rect, &new_btn_bg);
+                let plus = "+".encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &plus,
+                    &text_format,
+                    &new_btn_rect,
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                if !shell.tab_titles.is_empty() {
+                    let tabs_right = (new_btn_rect.left - 6.0).max(tabs_left + 100.0);
+                    let count = shell.tab_titles.len();
+                    let gap = 6.0;
+                    let total_gap = gap * count.saturating_sub(1) as f32;
+                    let tab_w =
+                        ((tabs_right - tabs_left - total_gap) / count as f32).clamp(140.0, 260.0);
+                    let accent_brush = self.create_brush(self.theme.accent.as_d2d())?;
+                    let close_brush = self.create_brush(self.theme.text_secondary.as_d2d())?;
+                    let mut x = tabs_left;
+                    for (idx, title) in shell.tab_titles.iter().enumerate() {
+                        let rect = D2D_RECT_F {
+                            left: x,
+                            top: tabs_top,
+                            right: (x + tab_w).min(tabs_right),
+                            bottom: tabs_bottom,
+                        };
+                        let brush = if idx == shell.active_tab {
+                            self.create_brush(self.theme.surface_hover.as_d2d())?
+                        } else {
+                            self.create_brush(self.theme.surface_secondary.as_d2d())?
+                        };
+                        self.d2d_context.FillRectangle(&rect, &brush);
+                        if idx == shell.active_tab {
+                            let accent_line = D2D_RECT_F {
+                                left: rect.left + 1.0,
+                                top: rect.bottom - 3.0,
+                                right: rect.right - 1.0,
+                                bottom: rect.bottom - 1.0,
+                            };
+                            self.d2d_context.FillRectangle(&accent_line, &accent_brush);
+                        }
+
+                        let text = title.encode_utf16().collect::<Vec<u16>>();
+                        self.d2d_context.DrawText(
+                            &text,
+                            &text_format,
+                            &D2D_RECT_F {
+                                left: rect.left + 10.0,
+                                top: rect.top + 6.0,
+                                right: rect.right - 18.0,
+                                bottom: rect.bottom - 4.0,
+                            },
+                            &text_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+
+                        let close = "x".encode_utf16().collect::<Vec<u16>>();
+                        self.d2d_context.DrawText(
+                            &close,
+                            &text_format,
+                            &D2D_RECT_F {
+                                left: rect.right - 16.0,
+                                top: rect.top + 7.0,
+                                right: rect.right - 4.0,
+                                bottom: rect.bottom - 5.0,
+                            },
+                            &close_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+
+                        x += tab_w + gap;
+                        if x + 80.0 > tabs_right {
+                            break;
+                        }
                     }
                 }
             }

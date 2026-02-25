@@ -26,16 +26,17 @@ use windows::{
                 AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
                 CreateWindowExW, DefWindowProcW, DispatchMessageW, GWLP_USERDATA, GetClientRect,
                 GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG,
+                IDCANCEL, IDNO, IDYES, MB_ICONWARNING, MB_YESNOCANCEL, MessageBoxW,
                 PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
                 SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow,
                 TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
                 WM_DROPFILES, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-                WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETTINGCHANGE,
-                WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+                WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
+                WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
             },
         },
     },
-    core::{Result, w},
+    core::{PCWSTR, Result, w},
 };
 
 use crate::{
@@ -487,6 +488,89 @@ fn path_is_read_only(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|meta| meta.permissions().readonly())
         .unwrap_or(false)
+}
+
+fn is_tab_dirty(tab: &crate::ui::tabs::TabState) -> bool {
+    tab.dirty || tab.document.dirty
+}
+
+fn to_wide_null(value: &str) -> Vec<u16> {
+    let mut wide = value.encode_utf16().collect::<Vec<u16>>();
+    wide.push(0);
+    wide
+}
+
+fn open_new_blank_tab(state: &mut WindowState) -> usize {
+    let index = state.tabs.new_blank_tab();
+    if state.tabs.tabs.len() > 20 {
+        state.app_state.status_text = format!(
+            "{} tabs open. Close inactive tabs to reduce memory usage.",
+            state.tabs.tabs.len()
+        );
+    }
+    index
+}
+
+fn close_tab_with_prompt(state: &mut WindowState, hwnd: HWND, index: usize) -> bool {
+    let (dirty, title) = match state.tabs.tabs.get(index) {
+        Some(tab) => (is_tab_dirty(tab), tab.title.clone()),
+        None => return false,
+    };
+
+    if dirty {
+        let prompt = format!("Save changes to '{title}' before closing?");
+        let prompt_wide = to_wide_null(prompt.as_str());
+        let choice = unsafe {
+            MessageBoxW(
+                Some(hwnd),
+                PCWSTR(prompt_wide.as_ptr()),
+                w!("Doco"),
+                MB_YESNOCANCEL | MB_ICONWARNING,
+            )
+        };
+
+        if choice == IDCANCEL {
+            state.app_state.status_text = "Close cancelled".to_string();
+            return true;
+        }
+
+        if choice == IDYES {
+            state.tabs.set_active(index);
+            let _ = save_active_document(state, hwnd, false);
+            let still_dirty = state
+                .tabs
+                .tabs
+                .get(index)
+                .map(is_tab_dirty)
+                .unwrap_or(false);
+            if still_dirty {
+                state.app_state.status_text =
+                    "Close cancelled (document still has unsaved changes)".to_string();
+                return true;
+            }
+        } else if choice != IDNO {
+            return true;
+        }
+    }
+
+    let closed_title = state
+        .tabs
+        .tabs
+        .get(index)
+        .map(|tab| tab.title.clone())
+        .unwrap_or_else(|| "Tab".to_string());
+    if state.tabs.close_tab(index) {
+        let active_title = state
+            .tabs
+            .active_tab()
+            .map(|tab| tab.title.clone())
+            .unwrap_or_else(|| "Welcome".to_string());
+        state.app_state.status_text = format!("Closed {closed_title}. Active: {active_title}");
+        sync_sidebar_with_active_tab(state);
+        return true;
+    }
+
+    false
 }
 
 fn save_active_document(state: &mut WindowState, hwnd: HWND, save_as: bool) -> bool {
@@ -2192,6 +2276,195 @@ fn collect_preview_lines(document: &DocumentModel, max_lines: usize) -> Vec<Stri
     out
 }
 
+fn append_block_text(block: &Block, out: &mut String) {
+    match block {
+        Block::Paragraph(p) => {
+            for run in &p.runs {
+                out.push_str(run.text.as_str());
+            }
+            out.push('\n');
+        }
+        Block::Heading(h) => {
+            for run in &h.runs {
+                out.push_str(run.text.as_str());
+            }
+            out.push('\n');
+        }
+        Block::CodeBlock(c) => {
+            out.push_str(c.code.as_str());
+            out.push('\n');
+        }
+        Block::List(list) => {
+            for item in &list.items {
+                for nested in &item.content {
+                    append_block_text(nested, out);
+                }
+            }
+        }
+        Block::Table(table) => {
+            for row in &table.rows {
+                for cell in &row.cells {
+                    for nested in &cell.blocks {
+                        append_block_text(nested, out);
+                    }
+                    out.push(' ');
+                }
+                out.push('\n');
+            }
+        }
+        Block::BlockQuote(quote) => {
+            for nested in &quote.blocks {
+                append_block_text(nested, out);
+            }
+        }
+        Block::Image(_) | Block::PageBreak | Block::HorizontalRule => {}
+    }
+}
+
+fn collect_document_plain_text(document: &DocumentModel) -> String {
+    let mut out = String::new();
+    for block in &document.content {
+        append_block_text(block, &mut out);
+    }
+    out
+}
+
+fn block_id_for_search(block: &Block) -> BlockId {
+    match block {
+        Block::Paragraph(p) => p.id,
+        Block::Heading(h) => h.id,
+        Block::CodeBlock(c) => c.id,
+        Block::List(list) => list
+            .items
+            .first()
+            .and_then(|item| item.content.first())
+            .map(block_id_for_search)
+            .unwrap_or(BlockId(0)),
+        Block::Image(image) => image.id,
+        Block::Table(table) => table.id,
+        Block::BlockQuote(quote) => quote.id,
+        Block::PageBreak | Block::HorizontalRule => BlockId(0),
+    }
+}
+
+fn find_in_all_open_tabs(state: &mut WindowState, query: &str) -> (usize, usize) {
+    let needle = query.trim();
+    if needle.is_empty() {
+        state.sidebar.set_search_results("", Vec::new());
+        return (0, 0);
+    }
+
+    let mut tabs_with_matches = 0usize;
+    let mut total_matches = 0usize;
+    let mut sidebar_results = Vec::new();
+
+    for tab in &state.tabs.tabs {
+        if tab.kind == TabKind::Welcome {
+            continue;
+        }
+
+        let text = collect_document_plain_text(&tab.document);
+        if text.is_empty() {
+            continue;
+        }
+
+        let mut offset = 0usize;
+        let mut tab_matches = 0usize;
+        while let Some(rel) = text[offset..].find(needle) {
+            let absolute = offset + rel;
+            tab_matches += 1;
+            total_matches += 1;
+
+            if sidebar_results.len() < 120 {
+                let chars_before = text[..absolute].chars().count();
+                let snippet_start = chars_before.saturating_sub(22);
+                let snippet = text
+                    .chars()
+                    .skip(snippet_start)
+                    .take(90)
+                    .collect::<String>()
+                    .replace('\n', " ");
+                let block_id = tab
+                    .document
+                    .content
+                    .first()
+                    .map(block_id_for_search)
+                    .unwrap_or(BlockId(0));
+                sidebar_results.push(SearchResultItem {
+                    block_id,
+                    line_or_page: 1,
+                    snippet: format!("{}: {}", tab.title, snippet.trim()),
+                    start: absolute,
+                    end: absolute + needle.len(),
+                });
+            }
+
+            offset = absolute + needle.len().max(1);
+            if offset >= text.len() {
+                break;
+            }
+        }
+
+        if tab_matches > 0 {
+            tabs_with_matches += 1;
+        }
+    }
+
+    state
+        .sidebar
+        .set_search_results(needle.to_string(), sidebar_results);
+    state.sidebar.set_active_panel(SidebarPanel::SearchResults);
+
+    (tabs_with_matches, total_matches)
+}
+
+fn tab_icon_label(tab: &crate::ui::tabs::TabState) -> &'static str {
+    if tab.kind == TabKind::Welcome {
+        return "[HOME]";
+    }
+    let extension = tab
+        .file_path
+        .as_ref()
+        .or(tab.document.metadata.file_path.as_ref())
+        .and_then(|path| path.extension().and_then(|v| v.to_str()))
+        .map(|value| value.to_ascii_lowercase());
+    match extension.as_deref() {
+        Some("docx") => "[DOCX]",
+        Some("pdf") => "[PDF]",
+        Some("md") | Some("markdown") => "[MD]",
+        Some("txt") => "[TXT]",
+        _ => "[DOC]",
+    }
+}
+
+fn tab_shell_title(tab: &crate::ui::tabs::TabState) -> String {
+    let dirty = if is_tab_dirty(tab) { " *" } else { "" };
+    format!("{} {}{}", tab_icon_label(tab), tab.title, dirty)
+}
+
+fn welcome_preview_lines(state: &WindowState) -> Vec<String> {
+    let mut lines = vec![
+        "DOCO".to_string(),
+        "Document editor".to_string(),
+        String::new(),
+        "Quick actions:".to_string(),
+        "  - Ctrl+O: Open file".to_string(),
+        "  - Ctrl+T: New tab".to_string(),
+        "  - Ctrl+Shift+S: Save As".to_string(),
+        "  - Ctrl+Shift+F: Find in all open tabs".to_string(),
+        String::new(),
+        "Recent files:".to_string(),
+    ];
+    if state.jump_list.recent_files.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for recent in state.jump_list.recent_files.iter().take(8) {
+            lines.push(format!("  - {}", recent.display()));
+        }
+    }
+    lines
+}
+
 fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
     let mut word_count = 0usize;
     let mut character_count = 0usize;
@@ -2218,11 +2491,13 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
     let mut canvas_images = Vec::new();
     let mut canvas_tables = Vec::new();
     let mut current_block = None;
+    let mut active_is_welcome = false;
     let selected_image_id = state.selected_image;
 
     {
         let (tabs, image_cache) = (&mut state.tabs, &mut state.image_cache);
         if let Some(tab) = tabs.active_tab_mut() {
+            active_is_welcome = tab.kind == TabKind::Welcome;
             (word_count, character_count) = collect_document_stats(&tab.document);
             let visible_indices = tab.canvas.cull_and_cache_visible_pages(&tab.document);
             let all_page_rects = tab.canvas.page_rects(&tab.document);
@@ -2263,6 +2538,12 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
             canvas_images = collect_canvas_image_overlays(tab, selected_image_id, image_cache);
             canvas_tables = collect_canvas_table_overlays(tab);
         }
+    }
+    if active_is_welcome {
+        canvas_preview_lines = welcome_preview_lines(state);
+        canvas_cursor_visible = false;
+        canvas_images.clear();
+        canvas_tables.clear();
     }
     state.sidebar.set_current_outline_block(current_block);
     state.canvas_image_overlays = canvas_images.clone();
@@ -2382,6 +2663,23 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         })
     });
 
+    let visible_start = state.tabs.overflow_offset.min(state.tabs.tabs.len());
+    let visible_len = state.tabs.tab_rects.len();
+    let visible_end = (visible_start + visible_len).min(state.tabs.tabs.len());
+    let tab_titles = if visible_start < visible_end {
+        state.tabs.tabs[visible_start..visible_end]
+            .iter()
+            .map(tab_shell_title)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let active_tab = if state.tabs.active >= visible_start && state.tabs.active < visible_end {
+        state.tabs.active - visible_start
+    } else {
+        usize::MAX
+    };
+
     ShellRenderState {
         show_tabs: state.app_state.show_tabs,
         show_sidebar: state.app_state.show_sidebar,
@@ -2390,8 +2688,10 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         show_toolbar: state.app_state.show_toolbar,
         show_statusbar: state.app_state.show_statusbar,
         status_text: state.app_state.status_text.clone(),
-        tab_titles: state.tabs.tabs.iter().map(|t| t.title.clone()).collect(),
-        active_tab: state.tabs.active,
+        tab_titles,
+        active_tab,
+        tab_has_overflow_left: state.tabs.overflow_offset > 0,
+        tab_has_overflow_right: state.tabs.overflow_offset + state.tabs.tab_rects.len() < state.tabs.tabs.len(),
         toolbar_labels: state
             .toolbar
             .buttons
@@ -2617,7 +2917,7 @@ unsafe extern "system" fn window_proc(
                 }
 
                 if !opened_any {
-                    let _ = state.tabs.new_blank_tab();
+                    state.app_state.status_text = "Welcome to Doco".to_string();
                 }
 
                 sync_sidebar_with_active_tab(state);
@@ -2849,6 +3149,9 @@ unsafe extern "system" fn window_proc(
                             let _ = save_active_document(state, hwnd, true);
                         } else if handled && state.app_state.status_text == "Export PDF" {
                             let _ = export_active_document(state, hwnd, "pdf");
+                        } else if handled && state.app_state.status_text == "Close tab" {
+                            let active_index = state.tabs.active;
+                            let _ = close_tab_with_prompt(state, hwnd, active_index);
                         }
                     }
                     if handled {
@@ -2965,6 +3268,25 @@ unsafe extern "system" fn window_proc(
                         }
                         Err(_) => {}
                     }
+                }
+
+                if ctrl_down && shift_down && vk == 0x46 {
+                    if state.find_replace.query.trim().is_empty() {
+                        state.find_replace.open_find();
+                        state.find_focus = FindFieldFocus::Query;
+                        state.app_state.status_text =
+                            "Set a Find query, then press Ctrl+Shift+F to search all tabs".to_string();
+                    } else {
+                        let query = state.find_replace.query.clone();
+                        let (tabs_with_matches, total_matches) =
+                            find_in_all_open_tabs(state, query.as_str());
+                        state.app_state.status_text = format!(
+                            "Find all: '{}' matched {} times in {} tab(s)",
+                            query, total_matches, tabs_with_matches
+                        );
+                    }
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
                 }
 
                 if ctrl_down && !shift_down && vk == 0x46 {
@@ -3225,7 +3547,7 @@ unsafe extern "system" fn window_proc(
                     return LRESULT(0);
                 }
 
-                if ctrl_down && !shift_down && vk == 0x54 {
+                if ctrl_down && shift_down && vk == 0x54 {
                     state.app_state.show_toolbar = !state.app_state.show_toolbar;
                     state.app_state.status_text = if state.app_state.show_toolbar {
                         "Toolbar shown".to_string()
@@ -3261,8 +3583,22 @@ unsafe extern "system" fn window_proc(
                     return LRESULT(0);
                 }
 
+                if ctrl_down && !shift_down && vk == 0x54 {
+                    let index = open_new_blank_tab(state);
+                    let title = state
+                        .tabs
+                        .tabs
+                        .get(index)
+                        .map(|tab| tab.title.clone())
+                        .unwrap_or_else(|| "New tab".to_string());
+                    state.app_state.status_text = format!("Opened {title}");
+                    sync_sidebar_with_active_tab(state);
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+
                 if ctrl_down && !shift_down && vk == 0x4E {
-                    let index = state.tabs.new_blank_tab();
+                    let index = open_new_blank_tab(state);
                     let title = state
                         .tabs
                         .tabs
@@ -3276,17 +3612,8 @@ unsafe extern "system" fn window_proc(
                 }
 
                 if ctrl_down && !shift_down && vk == 0x57 {
-                    if state.tabs.close_active_tab() {
-                        let active_title = state
-                            .tabs
-                            .active_tab()
-                            .map(|t| t.title.clone())
-                            .unwrap_or_else(|| "Welcome".to_string());
-                        state.app_state.status_text = format!("Active tab: {active_title}");
-                        sync_sidebar_with_active_tab(state);
-                    } else {
-                        state.app_state.status_text = "No tab to close".to_string();
-                    }
+                    let active_index = state.tabs.active;
+                    let _ = close_tab_with_prompt(state, hwnd, active_index);
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
                 }
@@ -3304,6 +3631,21 @@ unsafe extern "system" fn window_proc(
                         .map(|t| t.title.clone())
                         .unwrap_or_else(|| "Welcome".to_string());
                     state.app_state.status_text = format!("Switched to {active_title}");
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+
+                if ctrl_down && !shift_down && (0x31..=0x39).contains(&vk) {
+                    let tab_number = (vk - 0x30) as usize;
+                    state.tabs.switch_to_number(tab_number);
+                    sync_sidebar_with_active_tab(state);
+                    let active_title = state
+                        .tabs
+                        .active_tab()
+                        .map(|tab| tab.title.clone())
+                        .unwrap_or_else(|| "Welcome".to_string());
+                    state.app_state.status_text =
+                        format!("Switched to tab {tab_number}: {active_title}");
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
                 }
@@ -3500,6 +3842,34 @@ unsafe extern "system" fn window_proc(
                         return LRESULT(0);
                     }
                 }
+                if state.app_state.show_tabs {
+                    if let Some(index) = state.tabs.tab_close_hit_test(point) {
+                        let _ = close_tab_with_prompt(state, hwnd, index);
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+                    if state.tabs.new_button_hit_test(point) {
+                        let index = open_new_blank_tab(state);
+                        let title = state
+                            .tabs
+                            .tabs
+                            .get(index)
+                            .map(|tab| tab.title.clone())
+                            .unwrap_or_else(|| "New tab".to_string());
+                        state.app_state.status_text = format!("Opened {title}");
+                        sync_sidebar_with_active_tab(state);
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+                    if state.tabs.overflow_left_hit_test(point) && state.tabs.scroll_overflow_left() {
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+                    if state.tabs.overflow_right_hit_test(point) && state.tabs.scroll_overflow_right() {
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+                }
                 if sidebar_splitter_hit_test(state, point) {
                     state.sidebar_resizing = true;
                     state.sidebar.resizing = true;
@@ -3648,8 +4018,29 @@ unsafe extern "system" fn window_proc(
             }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
+        WM_MBUTTONDOWN => {
+            if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
+                let point = point_from_lparam(lparam);
+                if state.app_state.show_tabs
+                    && let Some(index) = state.tabs.tab_hit_test(point)
+                {
+                    let _ = close_tab_with_prompt(state, hwnd, index);
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
         WM_LBUTTONUP => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
+                let point = point_from_lparam(lparam);
+                if state.app_state.show_tabs {
+                    let tab_event = UiInputEvent::MouseUp(point);
+                    if state.tabs.handle_input(&tab_event) {
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+                }
                 if state.sidebar_resizing {
                     state.sidebar_resizing = false;
                     state.sidebar.resizing = false;
@@ -3677,6 +4068,19 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONDBLCLK => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
                 let point = point_from_lparam(lparam);
+                if state.app_state.show_tabs && state.tabs.is_empty_tab_bar_space(point) {
+                    let index = open_new_blank_tab(state);
+                    let title = state
+                        .tabs
+                        .tabs
+                        .get(index)
+                        .map(|tab| tab.title.clone())
+                        .unwrap_or_else(|| "New tab".to_string());
+                    state.app_state.status_text = format!("Opened {title}");
+                    sync_sidebar_with_active_tab(state);
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
                 if begin_image_interaction(state, point) {
                     state.image_properties_visible = true;
                     if let Some(selected) = state.selected_image {

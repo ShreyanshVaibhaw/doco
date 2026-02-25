@@ -13,6 +13,10 @@ use crate::{
 const TAB_HEIGHT: f32 = 36.0;
 const TAB_MIN_WIDTH: f32 = 140.0;
 const TAB_MAX_WIDTH: f32 = 260.0;
+const TAB_GAP: f32 = 6.0;
+const TAB_BAR_PADDING: f32 = 8.0;
+const NEW_TAB_BUTTON_WIDTH: f32 = 28.0;
+const OVERFLOW_BUTTON_WIDTH: f32 = 24.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabKind {
@@ -69,7 +73,12 @@ pub struct TabsBar {
     pub overflow_offset: usize,
     pub max_visible_tabs: usize,
     pub tab_rects: Vec<Rect>,
+    pub close_rects: Vec<Rect>,
+    pub new_tab_rect: Rect,
+    pub overflow_left_rect: Rect,
+    pub overflow_right_rect: Rect,
     pub hovered: Option<usize>,
+    dragging_tab: Option<usize>,
     next_id: u64,
 }
 
@@ -89,7 +98,12 @@ impl TabsBar {
             overflow_offset: 0,
             max_visible_tabs: 0,
             tab_rects: Vec::new(),
+            close_rects: Vec::new(),
+            new_tab_rect: Rect::default(),
+            overflow_left_rect: Rect::default(),
+            overflow_right_rect: Rect::default(),
             hovered: None,
+            dragging_tab: None,
             next_id: 1,
         };
         this.ensure_welcome_tab();
@@ -118,6 +132,8 @@ impl TabsBar {
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.remove_welcome_if_needed();
+        self.ensure_active_visible();
+        self.recalc_tab_layout();
         self.active
     }
 
@@ -133,6 +149,8 @@ impl TabsBar {
             .push(TabState::from_document(id, title, path, document));
         self.active = self.tabs.len() - 1;
         self.remove_welcome_if_needed();
+        self.ensure_active_visible();
+        self.recalc_tab_layout();
         self.active
     }
 
@@ -150,10 +168,14 @@ impl TabsBar {
             self.ensure_welcome_tab();
         }
 
-        if self.active >= self.tabs.len() {
+        if self.active > index {
+            self.active = self.active.saturating_sub(1);
+        } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         }
 
+        self.ensure_active_visible();
+        self.recalc_tab_layout();
         true
     }
 
@@ -161,6 +183,8 @@ impl TabsBar {
         if index + 1 < self.tabs.len() {
             self.tabs.truncate(index + 1);
             self.active = self.active.min(self.tabs.len().saturating_sub(1));
+            self.ensure_active_visible();
+            self.recalc_tab_layout();
         }
     }
 
@@ -173,10 +197,14 @@ impl TabsBar {
         self.tabs.clear();
         self.tabs.push(keep);
         self.active = 0;
+        self.ensure_active_visible();
+        self.recalc_tab_layout();
     }
 
     pub fn set_active(&mut self, index: usize) {
         self.active = index.min(self.tabs.len().saturating_sub(1));
+        self.ensure_active_visible();
+        self.recalc_tab_layout();
     }
 
     pub fn switch_next(&mut self) {
@@ -184,6 +212,8 @@ impl TabsBar {
             return;
         }
         self.active = (self.active + 1) % self.tabs.len();
+        self.ensure_active_visible();
+        self.recalc_tab_layout();
     }
 
     pub fn switch_prev(&mut self) {
@@ -195,6 +225,8 @@ impl TabsBar {
         } else {
             self.active -= 1;
         }
+        self.ensure_active_visible();
+        self.recalc_tab_layout();
     }
 
     pub fn switch_to_number(&mut self, one_based: usize) {
@@ -204,6 +236,8 @@ impl TabsBar {
         let index = one_based - 1;
         if index < self.tabs.len() {
             self.active = index;
+            self.ensure_active_visible();
+            self.recalc_tab_layout();
         }
     }
 
@@ -223,6 +257,8 @@ impl TabsBar {
             self.active += 1;
         }
 
+        self.ensure_active_visible();
+        self.recalc_tab_layout();
         true
     }
 
@@ -241,11 +277,76 @@ impl TabsBar {
             .map(|(idx, _)| idx + self.overflow_offset)
     }
 
+    pub fn tab_close_hit_test(&self, point: Point) -> Option<usize> {
+        self.close_rects
+            .iter()
+            .enumerate()
+            .find(|(_, rect)| contains(**rect, point))
+            .map(|(idx, _)| idx + self.overflow_offset)
+    }
+
+    pub fn new_button_hit_test(&self, point: Point) -> bool {
+        contains(self.new_tab_rect, point)
+    }
+
+    pub fn overflow_left_hit_test(&self, point: Point) -> bool {
+        self.overflow_left_rect.width > 0.0 && contains(self.overflow_left_rect, point)
+    }
+
+    pub fn overflow_right_hit_test(&self, point: Point) -> bool {
+        self.overflow_right_rect.width > 0.0 && contains(self.overflow_right_rect, point)
+    }
+
+    pub fn is_tab_bar_hit(&self, point: Point) -> bool {
+        self.visible && contains(self.bounds, point)
+    }
+
+    pub fn is_empty_tab_bar_space(&self, point: Point) -> bool {
+        self.is_tab_bar_hit(point)
+            && self.tab_hit_test(point).is_none()
+            && self.tab_close_hit_test(point).is_none()
+            && !self.new_button_hit_test(point)
+            && !self.overflow_left_hit_test(point)
+            && !self.overflow_right_hit_test(point)
+    }
+
+    pub fn scroll_overflow_left(&mut self) -> bool {
+        if self.overflow_offset == 0 {
+            return false;
+        }
+        self.overflow_offset = self.overflow_offset.saturating_sub(1);
+        self.recalc_tab_layout();
+        true
+    }
+
+    pub fn scroll_overflow_right(&mut self) -> bool {
+        let visible = self.tab_rects.len().max(1);
+        if self.overflow_offset + visible >= self.tabs.len() {
+            return false;
+        }
+        self.overflow_offset += 1;
+        self.recalc_tab_layout();
+        true
+    }
+
     pub fn middle_click_close(&mut self, point: Point) -> bool {
         if let Some(index) = self.tab_hit_test(point) {
             return self.close_tab(index);
         }
         false
+    }
+
+    fn ensure_active_visible(&mut self) {
+        if self.tabs.is_empty() {
+            self.overflow_offset = 0;
+            return;
+        }
+        let visible = self.max_visible_tabs.max(1);
+        if self.active < self.overflow_offset {
+            self.overflow_offset = self.active;
+        } else if self.active >= self.overflow_offset + visible {
+            self.overflow_offset = self.active + 1 - visible;
+        }
     }
 
     fn ensure_welcome_tab(&mut self) {
@@ -267,10 +368,57 @@ impl TabsBar {
 
     fn recalc_tab_layout(&mut self) {
         self.tab_rects.clear();
+        self.close_rects.clear();
+        self.new_tab_rect = Rect::default();
+        self.overflow_left_rect = Rect::default();
+        self.overflow_right_rect = Rect::default();
 
-        let reserved_for_new_btn = 42.0;
-        let available = (self.bounds.width - reserved_for_new_btn).max(0.0);
-        self.max_visible_tabs = ((available / TAB_MIN_WIDTH).floor() as usize).max(1);
+        if self.bounds.width <= 0.0 {
+            return;
+        }
+
+        let left_edge = self.bounds.x + TAB_BAR_PADDING;
+        let right_edge = (self.bounds.x + self.bounds.width - TAB_BAR_PADDING).max(left_edge);
+        self.new_tab_rect = Rect {
+            x: (right_edge - NEW_TAB_BUTTON_WIDTH).max(left_edge),
+            y: self.bounds.y + 5.0,
+            width: NEW_TAB_BUTTON_WIDTH,
+            height: TAB_HEIGHT - 10.0,
+        };
+
+        let mut tabs_left = left_edge;
+        let tabs_right = (self.new_tab_rect.x - TAB_GAP).max(tabs_left);
+
+        let available_without_overflow = (tabs_right - tabs_left).max(0.0);
+        let max_without_overflow = ((available_without_overflow + TAB_GAP) / (TAB_MIN_WIDTH + TAB_GAP))
+            .floor() as usize;
+        let overflow_needed = self.tabs.len() > max_without_overflow.max(1);
+
+        if overflow_needed {
+            self.overflow_left_rect = Rect {
+                x: tabs_left,
+                y: self.bounds.y + 6.0,
+                width: OVERFLOW_BUTTON_WIDTH,
+                height: TAB_HEIGHT - 12.0,
+            };
+            self.overflow_right_rect = Rect {
+                x: tabs_left + OVERFLOW_BUTTON_WIDTH + 4.0,
+                y: self.bounds.y + 6.0,
+                width: OVERFLOW_BUTTON_WIDTH,
+                height: TAB_HEIGHT - 12.0,
+            };
+            tabs_left = self.overflow_right_rect.x + self.overflow_right_rect.width + TAB_GAP;
+        } else {
+            self.overflow_offset = 0;
+        }
+
+        let available = (tabs_right - tabs_left).max(0.0);
+        self.max_visible_tabs = ((available + TAB_GAP) / (TAB_MIN_WIDTH + TAB_GAP)).floor() as usize;
+        self.max_visible_tabs = self.max_visible_tabs.max(1);
+
+        if self.overflow_offset + self.max_visible_tabs > self.tabs.len() {
+            self.overflow_offset = self.tabs.len().saturating_sub(self.max_visible_tabs);
+        }
 
         let visible_count = self
             .tabs
@@ -281,8 +429,9 @@ impl TabsBar {
             return;
         }
 
-        let tab_width = (available / visible_count as f32).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH);
-        let mut x = self.bounds.x;
+        let total_gap = TAB_GAP * visible_count.saturating_sub(1) as f32;
+        let tab_width = ((available - total_gap) / visible_count as f32).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH);
+        let mut x = tabs_left;
 
         for _ in 0..visible_count {
             self.tab_rects.push(Rect {
@@ -291,7 +440,13 @@ impl TabsBar {
                 width: tab_width,
                 height: TAB_HEIGHT,
             });
-            x += tab_width;
+            self.close_rects.push(Rect {
+                x: (x + tab_width - 18.0).max(x + 4.0),
+                y: self.bounds.y + 10.0,
+                width: 12.0,
+                height: 12.0,
+            });
+            x += tab_width + TAB_GAP;
         }
     }
 }
@@ -314,24 +469,48 @@ impl UIComponent for TabsBar {
     fn handle_input(&mut self, event: &InputEvent) -> bool {
         match event {
             InputEvent::MouseMove(point) => {
-                self.hovered = self.tab_hit_test(*point);
-                self.hovered.is_some()
+                let mut changed = false;
+                let hovered = self.tab_hit_test(*point);
+                if self.hovered != hovered {
+                    self.hovered = hovered;
+                    changed = true;
+                }
+                if let Some(dragging) = self.dragging_tab
+                    && let Some(target) = self.tab_hit_test(*point)
+                    && target != dragging
+                    && self.reorder_tab(dragging, target)
+                {
+                    self.dragging_tab = Some(target);
+                    changed = true;
+                }
+                changed
             }
             InputEvent::MouseDown(point) => {
+                if self.overflow_left_hit_test(*point) {
+                    return self.scroll_overflow_left();
+                }
+                if self.overflow_right_hit_test(*point) {
+                    return self.scroll_overflow_right();
+                }
+                if self.new_button_hit_test(*point) {
+                    self.new_blank_tab();
+                    return true;
+                }
                 if let Some(index) = self.tab_hit_test(*point) {
                     self.set_active(index);
+                    self.dragging_tab = Some(index);
                     return true;
                 }
                 false
             }
-            InputEvent::KeyDown(vk) => match *vk {
-                0x54 => {
-                    self.new_blank_tab();
+            InputEvent::MouseUp(_) => {
+                if self.dragging_tab.take().is_some() {
                     true
+                } else {
+                    false
                 }
-                0x57 => self.close_active_tab(),
-                _ => false,
-            },
+            }
+            InputEvent::KeyDown(_) => false,
             _ => false,
         }
     }
@@ -354,4 +533,66 @@ fn contains(rect: Rect, point: Point) -> bool {
         && point.x <= rect.x + rect.width
         && point.y >= rect.y
         && point.y <= rect.y + rect.height
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_exposes_new_tab_and_overflow_controls() {
+        let mut tabs = TabsBar::new();
+        for _ in 0..8 {
+            tabs.new_blank_tab();
+        }
+        tabs.layout(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 640.0,
+                height: TAB_HEIGHT,
+            },
+            96.0,
+        );
+
+        assert!(tabs.new_tab_rect.width > 0.0);
+        assert!(!tabs.tab_rects.is_empty());
+        if tabs.tabs.len() > tabs.max_visible_tabs {
+            assert!(tabs.overflow_right_rect.width > 0.0);
+        }
+    }
+
+    #[test]
+    fn drag_reorders_tabs() {
+        let mut tabs = TabsBar::new();
+        tabs.new_blank_tab();
+        tabs.new_blank_tab();
+        tabs.new_blank_tab();
+        tabs.layout(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 820.0,
+                height: TAB_HEIGHT,
+            },
+            96.0,
+        );
+
+        let first = tabs.tabs[0].id;
+        let p0 = Point {
+            x: tabs.tab_rects[0].x + 12.0,
+            y: tabs.tab_rects[0].y + 12.0,
+        };
+        let p2 = Point {
+            x: tabs.tab_rects[2].x + 12.0,
+            y: tabs.tab_rects[2].y + 12.0,
+        };
+
+        let _ = tabs.handle_input(&InputEvent::MouseDown(p0));
+        let _ = tabs.handle_input(&InputEvent::MouseMove(p2));
+        let _ = tabs.handle_input(&InputEvent::MouseUp(p2));
+
+        assert_ne!(tabs.tabs[0].id, first);
+        assert!(tabs.tabs.iter().any(|tab| tab.id == first));
+    }
 }
