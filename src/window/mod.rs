@@ -2,7 +2,7 @@ use std::{
     ffi::c_void,
     mem::size_of,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use windows::{
@@ -80,7 +80,7 @@ use crate::{
     render::canvas::PageLayoutMode,
     render::d2d::{D2DRenderer, ShellRenderState},
     render::image_cache::{ImageDecodeCache, interpolation_hint, resolve_image_data},
-    settings::schema::Settings,
+    settings::schema::{Settings, SettingsCategory, SidebarDefaultPanel},
     theme::{
         Theme, ThemeManager,
         backgrounds::{BackgroundKind, from_canvas_preference},
@@ -88,6 +88,7 @@ use crate::{
     ui::{
         InputEvent as UiInputEvent, Point as UiPoint, Rect as UiRect, UIComponent,
         command_palette::CommandPalette,
+        dialog::Dialog,
         sidebar::{SearchResultItem, Sidebar, SidebarIntent, SidebarPanel},
         statusbar::{StatusAction, StatusBar, StatusBarInfo},
         tabs::{TabKind, TabsBar},
@@ -190,6 +191,7 @@ struct WindowState {
     app_state: AppState,
     tabs: TabsBar,
     sidebar: Sidebar,
+    settings_dialog: Dialog,
     command_palette: CommandPalette,
     find_replace: FindReplaceState,
     find_focus: FindFieldFocus,
@@ -264,6 +266,12 @@ impl AppWindow {
         app_state.show_sidebar = settings.appearance.show_sidebar;
         app_state.show_statusbar = settings.appearance.show_status_bar;
         app_state.show_tabs = settings.appearance.show_tab_bar;
+        let mut sidebar = Sidebar::default();
+        sidebar.set_active_panel(match settings.appearance.sidebar_default_panel {
+            SidebarDefaultPanel::Files => SidebarPanel::Files,
+            SidebarDefaultPanel::Outline => SidebarPanel::Outline,
+            SidebarDefaultPanel::Bookmarks => SidebarPanel::Bookmarks,
+        });
 
         let state = Box::new(WindowState {
             renderer: None,
@@ -277,7 +285,8 @@ impl AppWindow {
             startup_files: parse_startup_files_from_cli(),
             app_state,
             tabs: TabsBar::default(),
-            sidebar: Sidebar::default(),
+            sidebar,
+            settings_dialog: Dialog::default(),
             command_palette: CommandPalette::default(),
             find_replace: FindReplaceState::default(),
             find_focus: FindFieldFocus::Query,
@@ -2044,9 +2053,20 @@ fn block_snippet(document: &DocumentModel, block_id: BlockId) -> String {
 }
 
 fn canvas_viewport_size(state: &WindowState, width: f32, height: f32) -> (f32, f32) {
-    let tab_h = if state.app_state.show_tabs { 36.0 } else { 0.0 };
+    let ui_scale = state
+        .app_state
+        .settings
+        .appearance
+        .ui_scale
+        .as_factor()
+        .clamp(1.0, 2.0);
+    let tab_h = if state.app_state.show_tabs {
+        36.0 * ui_scale
+    } else {
+        0.0
+    };
     let status_h = if state.app_state.show_statusbar {
-        28.0
+        28.0 * ui_scale
     } else {
         0.0
     };
@@ -2056,7 +2076,7 @@ fn canvas_viewport_size(state: &WindowState, width: f32, height: f32) -> (f32, f
         0.0
     };
     let toolbar_h = if state.app_state.show_toolbar {
-        44.0
+        44.0 * ui_scale
     } else {
         0.0
     };
@@ -2067,9 +2087,20 @@ fn canvas_viewport_size(state: &WindowState, width: f32, height: f32) -> (f32, f
 }
 
 fn relayout_shell(state: &mut WindowState, width: f32, height: f32) {
-    let tab_h = if state.app_state.show_tabs { 36.0 } else { 0.0 };
+    let ui_scale = state
+        .app_state
+        .settings
+        .appearance
+        .ui_scale
+        .as_factor()
+        .clamp(1.0, 2.0);
+    let tab_h = if state.app_state.show_tabs {
+        36.0 * ui_scale
+    } else {
+        0.0
+    };
     let status_h = if state.app_state.show_statusbar {
-        28.0
+        28.0 * ui_scale
     } else {
         0.0
     };
@@ -2079,7 +2110,7 @@ fn relayout_shell(state: &mut WindowState, width: f32, height: f32) {
         0.0
     };
     let toolbar_h = if state.app_state.show_toolbar {
-        44.0
+        44.0 * ui_scale
     } else {
         0.0
     };
@@ -2137,6 +2168,15 @@ fn relayout_shell(state: &mut WindowState, width: f32, height: f32) {
         },
         state.dpi,
     );
+    state.settings_dialog.layout(
+        UiRect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        },
+        state.dpi,
+    );
 
     let (canvas_w, canvas_h) = canvas_viewport_size(state, width, height);
     if let Some(tab) = state.tabs.active_tab_mut() {
@@ -2154,6 +2194,81 @@ fn sync_theme_from_settings(state: &mut WindowState) -> bool {
     let changed = previous_name != next.name || previous_is_dark != next.is_dark;
     state.theme = next;
     changed
+}
+
+fn sidebar_panel_from_preference(pref: SidebarDefaultPanel) -> SidebarPanel {
+    match pref {
+        SidebarDefaultPanel::Files => SidebarPanel::Files,
+        SidebarDefaultPanel::Outline => SidebarPanel::Outline,
+        SidebarDefaultPanel::Bookmarks => SidebarPanel::Bookmarks,
+    }
+}
+
+fn set_settings_visible(state: &mut WindowState, visible: bool) {
+    state.app_state.show_settings = visible;
+    state.settings_dialog.set_visible(visible);
+}
+
+fn sync_runtime_from_settings(state: &mut WindowState, hwnd: HWND) {
+    let settings = state.settings_dialog.settings().clone();
+
+    let prev_show_toolbar = state.app_state.show_toolbar;
+    let prev_show_sidebar = state.app_state.show_sidebar;
+    let prev_show_statusbar = state.app_state.show_statusbar;
+    let prev_show_tabs = state.app_state.show_tabs;
+    let prev_ui_scale = state.app_state.settings.appearance.ui_scale.as_factor();
+    let prev_sidebar_panel = state.sidebar.active_panel;
+
+    state.app_state.settings = settings;
+    state.app_state.show_toolbar = state.app_state.settings.appearance.show_toolbar;
+    state.app_state.show_sidebar = state.app_state.settings.appearance.show_sidebar;
+    state.app_state.show_statusbar = state.app_state.settings.appearance.show_status_bar;
+    state.app_state.show_tabs = state.app_state.settings.appearance.show_tab_bar;
+
+    let preferred_panel =
+        sidebar_panel_from_preference(state.app_state.settings.appearance.sidebar_default_panel);
+    if state.sidebar.active_panel != SidebarPanel::SearchResults {
+        state.sidebar.set_active_panel(preferred_panel);
+    }
+
+    let autosave_seconds = state
+        .app_state
+        .settings
+        .files
+        .auto_save_interval
+        .as_seconds()
+        .unwrap_or(60 * 60 * 24 * 365 * 100)
+        .max(5);
+    let desired_interval = Duration::from_secs(autosave_seconds);
+    if state.app_state.autosave.interval != desired_interval {
+        state.app_state.autosave = crate::document::export::AutoSaveManager::new(autosave_seconds);
+    }
+
+    let next_ui_scale = state.app_state.settings.appearance.ui_scale.as_factor();
+    let needs_relayout = prev_show_toolbar != state.app_state.show_toolbar
+        || prev_show_sidebar != state.app_state.show_sidebar
+        || prev_show_statusbar != state.app_state.show_statusbar
+        || prev_show_tabs != state.app_state.show_tabs
+        || (prev_ui_scale - next_ui_scale).abs() > f32::EPSILON
+        || prev_sidebar_panel != state.sidebar.active_panel;
+
+    let theme_changed = sync_theme_from_settings(state);
+    if theme_changed {
+        if let Some(renderer) = &mut state.renderer {
+            renderer.set_theme(state.theme.clone());
+        }
+        unsafe { apply_window_effects(hwnd, state.theme.is_dark) };
+    }
+
+    if needs_relayout {
+        let mut client = RECT::default();
+        let _ = unsafe { GetClientRect(hwnd, &mut client) };
+        relayout_shell(
+            state,
+            (client.right - client.left).max(0) as f32,
+            (client.bottom - client.top).max(0) as f32,
+        );
+    }
 }
 
 fn collect_document_stats(document: &DocumentModel) -> (usize, usize) {
@@ -2587,6 +2702,23 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
     let command_palette_query = state.command_palette.query.clone();
     let command_palette_selected = state.command_palette.selected;
     let command_palette_results = state.command_palette.result_labels(8);
+    let settings_visible = state.settings_dialog.is_open();
+    let settings_query = state.settings_dialog.search_query().to_string();
+    let settings_category = state.settings_dialog.selected_category().title().to_string();
+    let settings_categories = state
+        .settings_dialog
+        .visible_categories()
+        .into_iter()
+        .map(|category| category.title().to_string())
+        .collect::<Vec<_>>();
+    let settings_rows = state.settings_dialog.setting_rows();
+    let settings_selected_row = state.settings_dialog.selected_setting_row();
+    let settings_conflicts = state.settings_dialog.has_conflicting_shortcuts();
+    let settings_save_error = state
+        .settings_dialog
+        .last_save_error()
+        .unwrap_or_default()
+        .to_string();
     let find_visible = state.find_replace.find_visible;
     let replace_visible = state.find_replace.replace_visible;
     let find_query = state.find_replace.query.clone();
@@ -2681,6 +2813,13 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
     };
 
     ShellRenderState {
+        ui_scale: state
+            .app_state
+            .settings
+            .appearance
+            .ui_scale
+            .as_factor()
+            .clamp(1.0, 2.0),
         show_tabs: state.app_state.show_tabs,
         show_sidebar: state.app_state.show_sidebar,
         sidebar_width: state.app_state.sidebar_width,
@@ -2706,6 +2845,14 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         command_palette_query,
         command_palette_results,
         command_palette_selected,
+        settings_visible,
+        settings_query,
+        settings_category,
+        settings_categories,
+        settings_rows,
+        settings_selected_row,
+        settings_conflicts,
+        settings_save_error,
         table_picker_visible: state.table_picker_visible,
         table_picker_rows: state.table_picker_rows,
         table_picker_cols: state.table_picker_cols,
@@ -2997,6 +3144,14 @@ unsafe extern "system" fn window_proc(
                 state.last_ui_tick = now;
                 state.sidebar.tick(dt);
                 state.command_palette.tick(dt);
+                if state.app_state.show_settings != state.settings_dialog.is_open() {
+                    state
+                        .settings_dialog
+                        .set_visible(state.app_state.show_settings);
+                }
+                state.settings_dialog.tick();
+                sync_runtime_from_settings(state, hwnd);
+                state.app_state.show_settings = state.settings_dialog.is_open();
                 let mut needs_next_frame = false;
                 if let Some(tab) = state.tabs.active_tab_mut() {
                     needs_next_frame |= tab.canvas.update(dt);
@@ -3051,6 +3206,17 @@ unsafe extern "system" fn window_proc(
                     x: canvas_w * 0.5,
                     y: canvas_h * 0.5,
                 };
+
+                if state.settings_dialog.is_open() && !state.command_palette.is_open() {
+                    let event = UiInputEvent::MouseWheel {
+                        delta,
+                        position: cursor_in_canvas,
+                    };
+                    let _ = state.settings_dialog.handle_input(&event);
+                    sync_runtime_from_settings(state, hwnd);
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
 
                 if let Some(tab) = state.tabs.active_tab_mut() {
                     tab.canvas.set_viewport(canvas_w, canvas_h);
@@ -3158,6 +3324,40 @@ unsafe extern "system" fn window_proc(
                         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                         return LRESULT(0);
                     }
+                }
+
+                if state.app_state.show_settings && !state.settings_dialog.is_open() {
+                    set_settings_visible(state, true);
+                    sync_runtime_from_settings(state, hwnd);
+                }
+
+                if state.settings_dialog.is_open() && !state.command_palette.is_open() {
+                    if ctrl_down
+                        && !shift_down
+                        && vk == 0x52
+                        && state.settings_dialog.selected_category()
+                            == SettingsCategory::KeyboardShortcuts
+                    {
+                        state.settings_dialog.reset_shortcuts();
+                        sync_runtime_from_settings(state, hwnd);
+                        state.app_state.status_text = "Shortcuts reset to defaults".to_string();
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+
+                    let event = UiInputEvent::KeyDown(vk);
+                    let handled_settings = state.settings_dialog.handle_input(&event);
+                    if handled_settings {
+                        state.app_state.show_settings = state.settings_dialog.is_open();
+                        sync_runtime_from_settings(state, hwnd);
+                        if !state.settings_dialog.is_open() {
+                            state.app_state.status_text = "Settings closed".to_string();
+                        } else {
+                            state.app_state.status_text = "Settings updated".to_string();
+                        }
+                    }
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
                 }
 
                 if state.table_picker_visible {
@@ -3503,12 +3703,16 @@ unsafe extern "system" fn window_proc(
                 }
 
                 if ctrl_down && !shift_down && vk == 0xBC {
-                    state.app_state.show_settings = !state.app_state.show_settings;
-                    state.app_state.status_text = if state.app_state.show_settings {
+                    let visible = !state.settings_dialog.is_open();
+                    set_settings_visible(state, visible);
+                    state.app_state.status_text = if visible {
                         "Settings toggled on".to_string()
                     } else {
                         "Settings toggled off".to_string()
                     };
+                    if visible {
+                        sync_runtime_from_settings(state, hwnd);
+                    }
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
                 }
@@ -3526,6 +3730,11 @@ unsafe extern "system" fn window_proc(
 
                 if ctrl_down && !shift_down && vk == 0x42 {
                     state.app_state.show_sidebar = !state.app_state.show_sidebar;
+                    let show_sidebar = state.app_state.show_sidebar;
+                    state.app_state.settings.appearance.show_sidebar = show_sidebar;
+                    state
+                        .settings_dialog
+                        .apply_change(|settings| settings.appearance.show_sidebar = show_sidebar);
                     if !state.app_state.show_sidebar && state.sidebar_resizing {
                         state.sidebar_resizing = false;
                         state.sidebar.resizing = false;
@@ -3549,6 +3758,11 @@ unsafe extern "system" fn window_proc(
 
                 if ctrl_down && shift_down && vk == 0x54 {
                     state.app_state.show_toolbar = !state.app_state.show_toolbar;
+                    let show_toolbar = state.app_state.show_toolbar;
+                    state.app_state.settings.appearance.show_toolbar = show_toolbar;
+                    state
+                        .settings_dialog
+                        .apply_change(|settings| settings.appearance.show_toolbar = show_toolbar);
                     state.app_state.status_text = if state.app_state.show_toolbar {
                         "Toolbar shown".to_string()
                     } else {
@@ -3567,6 +3781,11 @@ unsafe extern "system" fn window_proc(
 
                 if ctrl_down && !shift_down && vk == 0x4C {
                     state.app_state.show_statusbar = !state.app_state.show_statusbar;
+                    let show_status_bar = state.app_state.show_statusbar;
+                    state.app_state.settings.appearance.show_status_bar = show_status_bar;
+                    state.settings_dialog.apply_change(|settings| {
+                        settings.appearance.show_status_bar = show_status_bar
+                    });
                     state.app_state.status_text = if state.app_state.show_statusbar {
                         "Status bar shown".to_string()
                     } else {
@@ -3664,6 +3883,20 @@ unsafe extern "system" fn window_proc(
         WM_CHAR => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
                 let code = wparam.0 as u32;
+                if state.settings_dialog.is_open() && !state.command_palette.is_open() {
+                    if let Some(ch) = char::from_u32(code) {
+                        let event = UiInputEvent::Char(ch);
+                        if state.settings_dialog.handle_input(&event) {
+                            sync_runtime_from_settings(state, hwnd);
+                            state.app_state.show_settings = state.settings_dialog.is_open();
+                            state.app_state.status_text = "Settings updated".to_string();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                    }
+                    return LRESULT(0);
+                }
+
                 if state.table_picker_visible {
                     if let Some(ch) = char::from_u32(code) {
                         if ch.is_ascii_digit() {
@@ -3773,6 +4006,9 @@ unsafe extern "system" fn window_proc(
         WM_MOUSEMOVE => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
                 let point = point_from_lparam(lparam);
+                if state.settings_dialog.is_open() && !state.command_palette.is_open() {
+                    return LRESULT(0);
+                }
                 if state.table_picker_visible {
                     if update_table_picker_hover(state, point) {
                         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
@@ -3841,6 +4077,15 @@ unsafe extern "system" fn window_proc(
                         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                         return LRESULT(0);
                     }
+                }
+                if state.settings_dialog.is_open() && !state.command_palette.is_open() {
+                    let event = UiInputEvent::MouseDown(point);
+                    if state.settings_dialog.handle_input(&event) {
+                        sync_runtime_from_settings(state, hwnd);
+                        state.app_state.status_text = "Settings updated".to_string();
+                    }
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
                 }
                 if state.app_state.show_tabs {
                     if let Some(index) = state.tabs.tab_close_hit_test(point) {
@@ -4105,6 +4350,9 @@ unsafe extern "system" fn window_proc(
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_DESTROY => {
+            if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
+                state.settings_dialog.force_flush();
+            }
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }

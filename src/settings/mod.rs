@@ -184,9 +184,39 @@ fn settings_catalog() -> &'static [SettingSearchHit] {
         },
         SettingSearchHit {
             category: SettingsCategory::Appearance,
+            setting_key: "appearance.ui_font",
+            title: "UI Font",
+            summary: "Segoe UI Variable by default, or a custom UI font.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Appearance,
             setting_key: "appearance.ui_scale",
             title: "UI Scale",
             summary: "Scale shell UI independent of document zoom.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Appearance,
+            setting_key: "appearance.show_toolbar",
+            title: "Show Toolbar",
+            summary: "Toggle toolbar visibility.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Appearance,
+            setting_key: "appearance.show_sidebar",
+            title: "Show Sidebar",
+            summary: "Toggle sidebar visibility.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Appearance,
+            setting_key: "appearance.show_status_bar",
+            title: "Show Status Bar",
+            summary: "Toggle status bar visibility.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Appearance,
+            setting_key: "appearance.show_tab_bar",
+            title: "Show Tab Bar",
+            summary: "Toggle tab bar visibility.",
         },
         SettingSearchHit {
             category: SettingsCategory::Appearance,
@@ -202,9 +232,21 @@ fn settings_catalog() -> &'static [SettingSearchHit] {
         },
         SettingSearchHit {
             category: SettingsCategory::Editor,
+            setting_key: "editor.default_font_size_pt",
+            title: "Default Font Size",
+            summary: "Set the default editor font size in points.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Editor,
             setting_key: "editor.tab_size",
             title: "Tab Size",
             summary: "Use 2, 4, or 8 spaces for indentation.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Editor,
+            setting_key: "editor.insert_spaces_instead_of_tabs",
+            title: "Insert Spaces Instead of Tabs",
+            summary: "Insert spaces when the Tab key is used.",
         },
         SettingSearchHit {
             category: SettingsCategory::Editor,
@@ -214,9 +256,39 @@ fn settings_catalog() -> &'static [SettingSearchHit] {
         },
         SettingSearchHit {
             category: SettingsCategory::Editor,
+            setting_key: "editor.show_line_numbers",
+            title: "Show Line Numbers",
+            summary: "Display line numbers in text-centric views.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Editor,
             setting_key: "editor.cursor_style",
             title: "Cursor Style",
             summary: "Line, block, or underline cursor.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Editor,
+            setting_key: "editor.cursor_blink",
+            title: "Cursor Blink",
+            summary: "Enable or disable cursor blinking.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Editor,
+            setting_key: "editor.auto_indent",
+            title: "Auto-indent",
+            summary: "Automatically indent new lines.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Editor,
+            setting_key: "editor.auto_close_brackets",
+            title: "Auto-close Brackets",
+            summary: "Insert matching closing brackets automatically.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Editor,
+            setting_key: "editor.show_whitespace",
+            title: "Show Whitespace",
+            summary: "Off, selection only, or show all whitespace.",
         },
         SettingSearchHit {
             category: SettingsCategory::Document,
@@ -226,9 +298,33 @@ fn settings_catalog() -> &'static [SettingSearchHit] {
         },
         SettingSearchHit {
             category: SettingsCategory::Document,
+            setting_key: "document.default_margins",
+            title: "Default Margins",
+            summary: "Normal, Narrow, or Wide margins.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Document,
+            setting_key: "document.default_line_spacing",
+            title: "Default Line Spacing",
+            summary: "Default line spacing for new documents.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Document,
             setting_key: "document.default_view_mode",
             title: "Default View Mode",
             summary: "Page, continuous, or read mode.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Document,
+            setting_key: "document.default_zoom_percent",
+            title: "Default Zoom",
+            summary: "Default zoom percentage for new documents.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Document,
+            setting_key: "document.spelling_check",
+            title: "Spelling Check",
+            summary: "Enable or disable spell checking.",
         },
         SettingSearchHit {
             category: SettingsCategory::Files,
@@ -238,9 +334,27 @@ fn settings_catalog() -> &'static [SettingSearchHit] {
         },
         SettingSearchHit {
             category: SettingsCategory::Files,
+            setting_key: "files.create_backup_before_save",
+            title: "Create Backup Before Save",
+            summary: "Create a backup copy before writing files.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Files,
             setting_key: "files.default_save_format",
             title: "Default Save Format",
             summary: "Use .docx or another preferred format.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Files,
+            setting_key: "files.recent_files_count",
+            title: "Recent Files Count",
+            summary: "Number of recent files to keep in history.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Files,
+            setting_key: "files.default_open_folder",
+            title: "Default Open Folder",
+            summary: "Last used, Documents, or a specific path.",
         },
         SettingSearchHit {
             category: SettingsCategory::KeyboardShortcuts,
@@ -249,10 +363,34 @@ fn settings_catalog() -> &'static [SettingSearchHit] {
             summary: "Customize key bindings and detect conflicts.",
         },
         SettingSearchHit {
+            category: SettingsCategory::KeyboardShortcuts,
+            setting_key: "keyboard_shortcuts.reset_defaults",
+            title: "Reset Shortcuts",
+            summary: "Reset all keyboard shortcuts to defaults.",
+        },
+        SettingSearchHit {
             category: SettingsCategory::Performance,
             setting_key: "performance.hardware_acceleration",
             title: "Hardware Acceleration",
             summary: "Toggle GPU rendering acceleration.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Performance,
+            setting_key: "performance.max_undo_history",
+            title: "Max Undo History",
+            summary: "Maximum number of undo steps to retain.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Performance,
+            setting_key: "performance.background_pattern_quality",
+            title: "Background Pattern Quality",
+            summary: "Choose high or low background pattern quality.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::Performance,
+            setting_key: "performance.animated_backgrounds",
+            title: "Animated Backgrounds",
+            summary: "Enable or disable animated backgrounds.",
         },
         SettingSearchHit {
             category: SettingsCategory::Performance,
@@ -265,6 +403,30 @@ fn settings_catalog() -> &'static [SettingSearchHit] {
             setting_key: "about.version",
             title: "Version",
             summary: "Build and release version details.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::About,
+            setting_key: "about.check_updates_on_startup",
+            title: "Check Updates on Startup",
+            summary: "Automatically check for updates during startup.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::About,
+            setting_key: "about.licenses_url",
+            title: "Open Source Licenses",
+            summary: "Location of license information.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::About,
+            setting_key: "about.system_info_snapshot",
+            title: "System Info Snapshot",
+            summary: "Current GPU, memory, and OS snapshot info.",
+        },
+        SettingSearchHit {
+            category: SettingsCategory::About,
+            setting_key: "about.check_for_updates",
+            title: "Check for Updates Now",
+            summary: "Run a manual update check.",
         },
     ]
 }
