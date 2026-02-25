@@ -103,6 +103,8 @@ pub struct Table {
     pub id: BlockId,
     pub rows: Vec<TableRow>,
     pub column_widths: Vec<f32>,
+    #[serde(default)]
+    pub row_heights: Vec<f32>,
     pub borders: TableBorders,
     pub style: TableStylePreset,
     pub cell_padding: f32,

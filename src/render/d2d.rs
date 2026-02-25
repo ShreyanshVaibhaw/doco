@@ -61,6 +61,24 @@ pub struct CanvasImageShellItem {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct CanvasTableShellItem {
+    pub table_id: u64,
+    pub rect: UiRect,
+    pub rows: usize,
+    pub cols: usize,
+    pub cell_w: f32,
+    pub cell_h: f32,
+    pub header_h: f32,
+    pub gutter_w: f32,
+    pub selected: bool,
+    pub selection_mode: u8,
+    pub selection_start_row: usize,
+    pub selection_start_col: usize,
+    pub selection_end_row: usize,
+    pub selection_end_col: usize,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ShellRenderState {
     pub show_tabs: bool,
     pub show_sidebar: bool,
@@ -79,6 +97,12 @@ pub struct ShellRenderState {
     pub command_palette_query: String,
     pub command_palette_results: Vec<String>,
     pub command_palette_selected: usize,
+    pub table_picker_visible: bool,
+    pub table_picker_rows: usize,
+    pub table_picker_cols: usize,
+    pub table_picker_custom_rows: String,
+    pub table_picker_custom_cols: String,
+    pub table_picker_custom_focus_rows: bool,
     pub find_visible: bool,
     pub replace_visible: bool,
     pub find_query: String,
@@ -109,11 +133,14 @@ pub struct ShellRenderState {
     pub canvas_scroll_x: f32,
     pub canvas_scroll_y: f32,
     pub canvas_images: Vec<CanvasImageShellItem>,
+    pub canvas_tables: Vec<CanvasTableShellItem>,
     pub image_toolbar_visible: bool,
     pub image_properties_visible: bool,
     pub image_selected_size: String,
     pub image_selected_meta: String,
     pub image_selected_alt_text: String,
+    pub table_selected_meta: String,
+    pub table_selected_id: u64,
 }
 
 pub struct D2DRenderer {
@@ -605,6 +632,143 @@ impl D2DRenderer {
                 }
             }
 
+            if shell.table_picker_visible && !shell.command_palette_open {
+                let picker_w = 292.0_f32.min((canvas_rect.right - canvas_rect.left - 20.0).max(220.0));
+                let picker_h = 236.0;
+                let picker_x = canvas_rect.left + 10.0;
+                let picker_y = canvas_rect.top + 10.0;
+                let picker = D2D_RECT_F {
+                    left: picker_x,
+                    top: picker_y,
+                    right: picker_x + picker_w,
+                    bottom: picker_y + picker_h,
+                };
+                let panel_bg = self.create_brush(self.theme.surface_primary.as_d2d())?;
+                let panel_border = self.create_brush(self.theme.border_default.as_d2d())?;
+                self.d2d_context.FillRectangle(&picker, &panel_bg);
+                self.d2d_context.DrawRectangle(
+                    &picker,
+                    &panel_border,
+                    1.0,
+                    None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                );
+
+                let title = "Insert Table".encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &title,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: picker.left + 10.0,
+                        top: picker.top + 8.0,
+                        right: picker.right - 10.0,
+                        bottom: picker.top + 28.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let grid_left = picker.left + 12.0;
+                let grid_top = picker.top + 34.0;
+                let cell = 16.0f32;
+                let selected_fill = self.create_brush(
+                    crate::ui::Color::rgba(
+                        self.theme.accent.r,
+                        self.theme.accent.g,
+                        self.theme.accent.b,
+                        0.42,
+                    )
+                    .as_d2d(),
+                )?;
+                let grid_fill = self.create_brush(self.theme.surface_secondary.as_d2d())?;
+                let grid_line = self.create_brush(self.theme.border_subtle.as_d2d())?;
+                for r in 0..10usize {
+                    for c in 0..10usize {
+                        let left = grid_left + c as f32 * cell;
+                        let top = grid_top + r as f32 * cell;
+                        let rect = D2D_RECT_F {
+                            left,
+                            top,
+                            right: left + cell - 1.0,
+                            bottom: top + cell - 1.0,
+                        };
+                        let selected = r < shell.table_picker_rows && c < shell.table_picker_cols;
+                        self.d2d_context.FillRectangle(
+                            &rect,
+                            if selected { &selected_fill } else { &grid_fill },
+                        );
+                        self.d2d_context.DrawRectangle(
+                            &rect,
+                            &grid_line,
+                            1.0,
+                            None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                        );
+                    }
+                }
+
+                let dims = format!("{} x {}", shell.table_picker_rows, shell.table_picker_cols);
+                let dims_utf16 = dims.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &dims_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: grid_left,
+                        top: grid_top + 168.0,
+                        right: picker.right - 10.0,
+                        bottom: grid_top + 188.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let fields = format!(
+                    "Rows [{}]: {}   Cols [{}]: {}",
+                    if shell.table_picker_custom_focus_rows {
+                        "x"
+                    } else {
+                        " "
+                    },
+                    shell.table_picker_custom_rows,
+                    if shell.table_picker_custom_focus_rows {
+                        " "
+                    } else {
+                        "x"
+                    },
+                    shell.table_picker_custom_cols
+                );
+                let fields_utf16 = fields.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &fields_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: grid_left,
+                        top: grid_top + 188.0,
+                        right: picker.right - 10.0,
+                        bottom: grid_top + 208.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let hint = "[Enter] Insert  [Esc] Cancel  [Tab] Switch Field  [Arrows] Resize";
+                let hint_utf16 = hint.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &hint_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: grid_left,
+                        top: grid_top + 208.0,
+                        right: picker.right - 10.0,
+                        bottom: picker.bottom - 8.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+
             if shell.find_visible && !shell.command_palette_open {
                 let panel_w =
                     460.0_f32.min((canvas_rect.right - canvas_rect.left - 20.0).max(300.0));
@@ -994,6 +1158,65 @@ impl D2DRenderer {
                         top: props.top + 72.0,
                         right: props.right - 10.0,
                         bottom: props.bottom - 10.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+
+            if !shell.table_selected_meta.is_empty() {
+                let panel_w =
+                    700.0_f32.min((canvas_rect.right - canvas_rect.left - 20.0).max(320.0));
+                let panel_h = 68.0;
+                let panel_x = canvas_rect.left + 10.0;
+                let panel_y = if shell.image_properties_visible {
+                    canvas_rect.top + 210.0
+                } else {
+                    canvas_rect.top + 10.0
+                };
+                let panel = D2D_RECT_F {
+                    left: panel_x,
+                    top: panel_y,
+                    right: panel_x + panel_w,
+                    bottom: panel_y + panel_h,
+                };
+                let panel_bg = self.create_brush(self.theme.surface_secondary.as_d2d())?;
+                let panel_border = self.create_brush(self.theme.border_default.as_d2d())?;
+                self.d2d_context.FillRectangle(&panel, &panel_bg);
+                self.d2d_context.DrawRectangle(
+                    &panel,
+                    &panel_border,
+                    1.0,
+                    None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                );
+
+                let title = format!("Table #{}  {}", shell.table_selected_id, shell.table_selected_meta);
+                let title_utf16 = title.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &title_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: panel.left + 10.0,
+                        top: panel.top + 8.0,
+                        right: panel.right - 10.0,
+                        bottom: panel.top + 28.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let shortcuts = "Tab/Shift+Tab Move  Shift+Arrows Expand  Ctrl+Shift+M Merge  Ctrl+Shift+S Split  Ctrl+Shift+1..5 Style  Ctrl+Shift+U/J/H/K Insert Row/Col";
+                let shortcuts_utf16 = shortcuts.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &shortcuts_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: panel.left + 10.0,
+                        top: panel.top + 30.0,
+                        right: panel.right - 10.0,
+                        bottom: panel.bottom - 8.0,
                     },
                     &text_brush,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -1526,6 +1749,141 @@ impl D2DRenderer {
                             self.d2d_context.FillRectangle(&rect, &handle_brush);
                         }
                     }
+                }
+            }
+        }
+
+        if !shell.canvas_tables.is_empty() {
+            let table_bg = self.create_brush(self.theme.surface_secondary.as_d2d())?;
+            let table_border = self.create_brush(self.theme.border_default.as_d2d())?;
+            let table_header = self.create_brush(
+                crate::ui::Color::rgba(
+                    self.theme.surface_hover.r,
+                    self.theme.surface_hover.g,
+                    self.theme.surface_hover.b,
+                    0.8,
+                )
+                .as_d2d(),
+            )?;
+            let table_selected = self.create_brush(self.theme.accent.as_d2d())?;
+            let table_text = self.create_brush(self.theme.text_secondary.as_d2d())?;
+            let selection_fill = self.create_brush(
+                crate::ui::Color::rgba(
+                    self.theme.selection_bg.r,
+                    self.theme.selection_bg.g,
+                    self.theme.selection_bg.b,
+                    0.32,
+                )
+                .as_d2d(),
+            )?;
+
+            for table in shell.canvas_tables.iter().take(10) {
+                let left = canvas_rect.left + table.rect.x;
+                let top = canvas_rect.top + table.rect.y;
+                let right = left + table.rect.width;
+                let bottom = top + table.rect.height;
+                let table_rect = D2D_RECT_F {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                };
+
+                if right < page_rect.left
+                    || left > page_rect.right
+                    || bottom < page_rect.top
+                    || top > page_rect.bottom
+                {
+                    continue;
+                }
+
+                unsafe {
+                    self.d2d_context.FillRectangle(&table_rect, &table_bg);
+                    self.d2d_context.DrawRectangle(
+                        &table_rect,
+                        if table.selected {
+                            &table_selected
+                        } else {
+                            &table_border
+                        },
+                        if table.selected { 2.0 } else { 1.0 },
+                        None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                    );
+                }
+
+                let header_rect = D2D_RECT_F {
+                    left: left + table.gutter_w,
+                    top,
+                    right,
+                    bottom: top + table.header_h,
+                };
+                let gutter_rect = D2D_RECT_F {
+                    left,
+                    top: top + table.header_h,
+                    right: left + table.gutter_w,
+                    bottom,
+                };
+                unsafe {
+                    self.d2d_context.FillRectangle(&header_rect, &table_header);
+                    self.d2d_context.FillRectangle(&gutter_rect, &table_header);
+                }
+
+                for r in 0..table.rows {
+                    for c in 0..table.cols {
+                        let cell_left = left + table.gutter_w + c as f32 * table.cell_w;
+                        let cell_top = top + table.header_h + r as f32 * table.cell_h;
+                        let cell_rect = D2D_RECT_F {
+                            left: cell_left,
+                            top: cell_top,
+                            right: cell_left + table.cell_w,
+                            bottom: cell_top + table.cell_h,
+                        };
+
+                        let in_selection = if table.selection_mode == 4 {
+                            true
+                        } else if table.selection_mode == 2 {
+                            r >= table.selection_start_row && r <= table.selection_end_row
+                        } else if table.selection_mode == 3 {
+                            c >= table.selection_start_col && c <= table.selection_end_col
+                        } else if table.selection_mode == 1 {
+                            r >= table.selection_start_row
+                                && r <= table.selection_end_row
+                                && c >= table.selection_start_col
+                                && c <= table.selection_end_col
+                        } else {
+                            false
+                        };
+
+                        unsafe {
+                            if in_selection {
+                                self.d2d_context.FillRectangle(&cell_rect, &selection_fill);
+                            }
+                            self.d2d_context.DrawRectangle(
+                                &cell_rect,
+                                &table_border,
+                                1.0,
+                                None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                            );
+                        }
+                    }
+                }
+
+                let label = format!("[Table #{}] {}x{}", table.table_id, table.rows, table.cols);
+                let label_utf16 = label.encode_utf16().collect::<Vec<u16>>();
+                unsafe {
+                    self.d2d_context.DrawText(
+                        &label_utf16,
+                        &self.create_text_format()?,
+                        &D2D_RECT_F {
+                            left: left + table.gutter_w + 4.0,
+                            top: top + 2.0,
+                            right: right - 6.0,
+                            bottom: top + table.header_h - 2.0,
+                        },
+                        &table_text,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
                 }
             }
         }

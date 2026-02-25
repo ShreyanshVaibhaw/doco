@@ -955,10 +955,12 @@ fn parse_document_xml(
                                 .collect::<Vec<_>>();
 
                             let col_count = rows.first().map(|r| r.cells.len()).unwrap_or(1);
+                            let row_count = rows.len();
                             doc.content.push(Block::Table(Table {
                                 id: next_block_id(&mut block_id),
                                 rows,
                                 column_widths: vec![120.0; col_count],
+                                row_heights: vec![28.0; row_count],
                                 borders: TableBorders::default(),
                                 style: crate::document::model::TableStylePreset::Grid,
                                 cell_padding: 4.0,

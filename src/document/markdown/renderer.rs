@@ -425,6 +425,7 @@ pub fn markdown_to_model(doc: &MarkdownDocument, base_path: Option<&Path>) -> Do
                             .alignments
                             .len()
                             .max(table.rows.first().map(|r| r.cells.len()).unwrap_or(0));
+                        let row_count = table.rows.len();
                         model.content.push(Block::Table(Table {
                             id: BlockId(next_id),
                             rows: table.rows,
@@ -433,6 +434,7 @@ pub fn markdown_to_model(doc: &MarkdownDocument, base_path: Option<&Path>) -> Do
                             } else {
                                 vec![1.0 / column_count as f32; column_count]
                             },
+                            row_heights: vec![28.0; row_count],
                             borders: crate::document::model::TableBorders::default(),
                             style: crate::document::model::TableStylePreset::Grid,
                             cell_padding: 8.0,

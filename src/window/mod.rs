@@ -44,13 +44,36 @@ use crate::{
         DocumentFormat, detect_format,
         docx::parser::parse_docx,
         markdown::MarkdownDocument,
-        model::{Block, BlockId, DocumentModel, ImageAlignment, ImageBorder, ImageBorderStyle},
+        model::{
+            Block, BlockId, DocumentModel, ImageAlignment, ImageBorder, ImageBorderStyle,
+            TableStylePreset,
+        },
         txt::TextDocument,
     },
     editor::{
         clipboard::read_clipboard_image,
         image_ops::load_supported_image,
         search::{FindReplaceState, replace_all, replace_current, replacement_preview},
+        table::{
+            CellPos,
+            TableSelection,
+            apply_style as apply_table_style,
+            delete_column as delete_table_column,
+            delete_row as delete_table_row,
+            distribute_columns_evenly,
+            fit_columns_to_content,
+            find_table_mut,
+            insert_column_left,
+            insert_column_right,
+            insert_row_above,
+            insert_row_below,
+            insert_table,
+            merge_cells as merge_table_cells,
+            resize_column as resize_table_column,
+            resize_row as resize_table_row,
+            split_cell as split_table_cell,
+            visible_row_range,
+        },
     },
     render::canvas::PageLayoutMode,
     render::d2d::{D2DRenderer, ShellRenderState},
@@ -96,6 +119,18 @@ struct CanvasImageOverlay {
     alt_text: String,
 }
 
+#[derive(Debug, Clone)]
+struct CanvasTableOverlay {
+    table_id: BlockId,
+    rect: UiRect,
+    rows: usize,
+    cols: usize,
+    cell_w: f32,
+    cell_h: f32,
+    header_h: f32,
+    gutter_w: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImageDragKind {
     Move,
@@ -112,6 +147,32 @@ struct ImageDragState {
     start_height: f32,
     start_alignment: ImageAlignment,
     kind: ImageDragKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableSelectionMode {
+    Cell(CellPos),
+    Row(usize),
+    Column(usize),
+    Table,
+}
+
+#[derive(Debug, Clone)]
+struct TableResizeState {
+    table_id: BlockId,
+    row: Option<usize>,
+    col: Option<usize>,
+    start_mouse: UiPoint,
+    start_value: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TablePickerLayout {
+    panel: UiRect,
+    grid: UiRect,
+    rows_input: UiRect,
+    cols_input: UiRect,
+    insert_button: UiRect,
 }
 
 struct WindowState {
@@ -135,6 +196,17 @@ struct WindowState {
     selected_image: Option<BlockId>,
     image_drag: Option<ImageDragState>,
     image_properties_visible: bool,
+    table_picker_visible: bool,
+    table_picker_rows: usize,
+    table_picker_cols: usize,
+    table_picker_custom_rows: String,
+    table_picker_custom_cols: String,
+    table_picker_custom_focus_rows: bool,
+    canvas_table_overlays: Vec<CanvasTableOverlay>,
+    selected_table: Option<BlockId>,
+    table_selection_mode: Option<TableSelectionMode>,
+    table_selection_range: Option<TableSelection>,
+    table_resize: Option<TableResizeState>,
     goto_visible: bool,
     goto_input: String,
     toolbar: Toolbar,
@@ -212,6 +284,17 @@ impl AppWindow {
             selected_image: None,
             image_drag: None,
             image_properties_visible: false,
+            table_picker_visible: false,
+            table_picker_rows: 3,
+            table_picker_cols: 3,
+            table_picker_custom_rows: "3".to_string(),
+            table_picker_custom_cols: "3".to_string(),
+            table_picker_custom_focus_rows: true,
+            canvas_table_overlays: Vec::new(),
+            selected_table: None,
+            table_selection_mode: None,
+            table_selection_range: None,
+            table_resize: None,
             goto_visible: false,
             goto_input: String::new(),
             toolbar: Toolbar::default(),
@@ -369,6 +452,14 @@ fn sync_sidebar_with_active_tab(state: &mut WindowState) {
             state.image_properties_visible = false;
         }
     }
+    if let Some(selected) = state.selected_table {
+        if active_table_ref(state, selected).is_none() {
+            state.selected_table = None;
+            state.table_selection_mode = None;
+            state.table_selection_range = None;
+            state.table_resize = None;
+        }
+    }
 
     if root_path.is_none() {
         root_path = std::env::current_dir().ok();
@@ -482,6 +573,416 @@ fn active_image_ref(
             _ => None,
         })
     })
+}
+
+fn active_table_ref(state: &WindowState, table_id: BlockId) -> Option<&crate::document::model::Table> {
+    state.tabs.active_tab().and_then(|tab| {
+        tab.document.content.iter().find_map(|block| match block {
+            Block::Table(table) if table.id == table_id => Some(table),
+            _ => None,
+        })
+    })
+}
+
+fn open_table_picker(state: &mut WindowState) {
+    state.table_picker_visible = true;
+    state.table_picker_rows = state.table_picker_rows.clamp(1, 10);
+    state.table_picker_cols = state.table_picker_cols.clamp(1, 10);
+    state.table_picker_custom_rows = state.table_picker_rows.to_string();
+    state.table_picker_custom_cols = state.table_picker_cols.to_string();
+    state.table_picker_custom_focus_rows = true;
+}
+
+fn parse_table_picker_custom(value: &str, fallback: usize) -> usize {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .unwrap_or(fallback)
+        .clamp(1, 64)
+}
+
+fn table_insert_index_for_cursor(tab: &crate::ui::tabs::TabState) -> usize {
+    tab.document
+        .content
+        .iter()
+        .position(|block| match block {
+            Block::Paragraph(p) => p.id == tab.cursor.primary.block_id,
+            Block::Heading(h) => h.id == tab.cursor.primary.block_id,
+            Block::CodeBlock(c) => c.id == tab.cursor.primary.block_id,
+            Block::Image(i) => i.id == tab.cursor.primary.block_id,
+            Block::Table(t) => t.id == tab.cursor.primary.block_id,
+            Block::BlockQuote(q) => q.id == tab.cursor.primary.block_id,
+            _ => false,
+        })
+        .map(|idx| idx + 1)
+        .unwrap_or(tab.document.content.len())
+}
+
+fn insert_table_at_cursor(state: &mut WindowState, rows: usize, cols: usize) -> Option<BlockId> {
+    let inserted = {
+        let tab = state.tabs.active_tab_mut()?;
+        let insert_idx = table_insert_index_for_cursor(tab);
+        let id = insert_table(&mut tab.document, insert_idx, rows, cols);
+        tab.cursor.primary.block_id = id;
+        tab.cursor.primary.offset = 0;
+        tab.dirty = true;
+        id
+    };
+
+    state.selected_table = Some(inserted);
+    state.table_selection_mode = Some(TableSelectionMode::Cell(CellPos { row: 0, col: 0 }));
+    state.table_selection_range = Some(TableSelection {
+        start: CellPos { row: 0, col: 0 },
+        end: CellPos { row: 0, col: 0 },
+    });
+    sync_sidebar_with_active_tab(state);
+    Some(inserted)
+}
+
+fn insert_table_from_picker(state: &mut WindowState) -> Option<BlockId> {
+    let rows = parse_table_picker_custom(state.table_picker_custom_rows.as_str(), state.table_picker_rows);
+    let cols = parse_table_picker_custom(state.table_picker_custom_cols.as_str(), state.table_picker_cols);
+    state.table_picker_rows = rows.clamp(1, 10);
+    state.table_picker_cols = cols.clamp(1, 10);
+    state.table_picker_visible = false;
+    insert_table_at_cursor(state, rows, cols)
+}
+
+fn table_picker_layout(state: &WindowState) -> TablePickerLayout {
+    let origin = canvas_origin(state);
+    let panel = UiRect {
+        x: origin.x + 10.0,
+        y: origin.y + 10.0,
+        width: 292.0,
+        height: 236.0,
+    };
+    let grid = UiRect {
+        x: panel.x + 12.0,
+        y: panel.y + 34.0,
+        width: 160.0,
+        height: 160.0,
+    };
+    TablePickerLayout {
+        panel,
+        grid,
+        rows_input: UiRect {
+            x: panel.x + 12.0,
+            y: panel.y + 192.0,
+            width: 78.0,
+            height: 18.0,
+        },
+        cols_input: UiRect {
+            x: panel.x + 96.0,
+            y: panel.y + 192.0,
+            width: 78.0,
+            height: 18.0,
+        },
+        insert_button: UiRect {
+            x: panel.x + panel.width - 90.0,
+            y: panel.y + panel.height - 28.0,
+            width: 76.0,
+            height: 20.0,
+        },
+    }
+}
+
+fn update_table_picker_hover(state: &mut WindowState, point: UiPoint) -> bool {
+    if !state.table_picker_visible {
+        return false;
+    }
+    let layout = table_picker_layout(state);
+    if !contains_rect(layout.grid, point) {
+        return false;
+    }
+
+    let rel_x = (point.x - layout.grid.x).max(0.0);
+    let rel_y = (point.y - layout.grid.y).max(0.0);
+    let cols = ((rel_x / 16.0).floor() as usize + 1).clamp(1, 10);
+    let rows = ((rel_y / 16.0).floor() as usize + 1).clamp(1, 10);
+    if state.table_picker_rows == rows && state.table_picker_cols == cols {
+        return false;
+    }
+    state.table_picker_rows = rows;
+    state.table_picker_cols = cols;
+    state.table_picker_custom_rows = rows.to_string();
+    state.table_picker_custom_cols = cols.to_string();
+    true
+}
+
+fn handle_table_picker_click(state: &mut WindowState, point: UiPoint) -> bool {
+    if !state.table_picker_visible {
+        return false;
+    }
+    let layout = table_picker_layout(state);
+    if !contains_rect(layout.panel, point) {
+        state.table_picker_visible = false;
+        state.app_state.status_text = "Insert table cancelled".to_string();
+        return true;
+    }
+
+    if contains_rect(layout.grid, point) {
+        let rel_x = (point.x - layout.grid.x).max(0.0);
+        let rel_y = (point.y - layout.grid.y).max(0.0);
+        state.table_picker_cols = ((rel_x / 16.0).floor() as usize + 1).clamp(1, 10);
+        state.table_picker_rows = ((rel_y / 16.0).floor() as usize + 1).clamp(1, 10);
+        state.table_picker_custom_rows = state.table_picker_rows.to_string();
+        state.table_picker_custom_cols = state.table_picker_cols.to_string();
+        if let Some(id) = insert_table_from_picker(state) {
+            state.app_state.status_text = format!(
+                "Inserted table {} ({}x{})",
+                id.0, state.table_picker_rows, state.table_picker_cols
+            );
+        } else {
+            state.app_state.status_text = "Insert table failed".to_string();
+        }
+        return true;
+    }
+
+    if contains_rect(layout.rows_input, point) {
+        state.table_picker_custom_focus_rows = true;
+        return true;
+    }
+    if contains_rect(layout.cols_input, point) {
+        state.table_picker_custom_focus_rows = false;
+        return true;
+    }
+    if contains_rect(layout.insert_button, point) {
+        if let Some(id) = insert_table_from_picker(state) {
+            state.app_state.status_text = format!(
+                "Inserted table {} ({}x{})",
+                id.0, state.table_picker_rows, state.table_picker_cols
+            );
+        } else {
+            state.app_state.status_text = "Insert table failed".to_string();
+        }
+        return true;
+    }
+    true
+}
+
+fn move_table_selection(state: &mut WindowState, row_delta: isize, col_delta: isize, expand: bool) -> bool {
+    let Some(table_id) = state.selected_table else {
+        return false;
+    };
+    let Some(table) = active_table_ref(state, table_id) else {
+        return false;
+    };
+    let rows = table.rows.len().max(1);
+    let cols = table.column_widths.len().max(1);
+
+    let current = selected_table_cell(state).unwrap_or(CellPos { row: 0, col: 0 });
+    let row = (current.row as isize + row_delta).clamp(0, rows.saturating_sub(1) as isize) as usize;
+    let col = (current.col as isize + col_delta).clamp(0, cols.saturating_sub(1) as isize) as usize;
+    let end = CellPos { row, col };
+
+    if expand {
+        let start = state
+            .table_selection_range
+            .as_ref()
+            .map(|selection| selection.start)
+            .unwrap_or(current);
+        state.table_selection_mode = Some(TableSelectionMode::Cell(end));
+        state.table_selection_range = Some(TableSelection { start, end });
+    } else {
+        state.table_selection_mode = Some(TableSelectionMode::Cell(end));
+        state.table_selection_range = Some(TableSelection { start: end, end });
+    }
+    true
+}
+
+fn table_selected_row_col(state: &WindowState) -> Option<(usize, usize)> {
+    match state.table_selection_mode {
+        Some(TableSelectionMode::Cell(cell)) => Some((cell.row, cell.col)),
+        Some(TableSelectionMode::Row(row)) => Some((row, 0)),
+        Some(TableSelectionMode::Column(col)) => Some((0, col)),
+        Some(TableSelectionMode::Table) | None => None,
+    }
+}
+
+fn apply_table_shortcut(state: &mut WindowState, vk: u32, ctrl_down: bool, shift_down: bool) -> bool {
+    let Some(table_id) = state.selected_table else {
+        return false;
+    };
+
+    if vk == 0x09 {
+        if navigate_table_cell(state, shift_down) {
+            if let Some(cell) = selected_table_cell(state) {
+                state.app_state.status_text = format!("Table cell {},{}", cell.row + 1, cell.col + 1);
+            }
+            return true;
+        }
+    }
+
+    if !ctrl_down && (vk == 0x25 || vk == 0x26 || vk == 0x27 || vk == 0x28) {
+        let (dr, dc) = match vk {
+            0x25 => (0, -1),
+            0x26 => (-1, 0),
+            0x27 => (0, 1),
+            0x28 => (1, 0),
+            _ => (0, 0),
+        };
+        if move_table_selection(state, dr, dc, shift_down) {
+            if let Some(sel) = &state.table_selection_range {
+                state.app_state.status_text = format!(
+                    "Table selection {}:{}, {}:{}",
+                    sel.start.row + 1,
+                    sel.start.col + 1,
+                    sel.end.row + 1,
+                    sel.end.col + 1
+                );
+            }
+            return true;
+        }
+    }
+
+    if vk == VK_DELETE.0 as u32 {
+        let mut changed = false;
+        if let Some(tab) = state.tabs.active_tab_mut() {
+            if let Some(table) = find_table_mut(&mut tab.document, table_id) {
+                match state.table_selection_mode {
+                    Some(TableSelectionMode::Row(row)) => {
+                        if table.rows.len() > 1 {
+                            changed = delete_table_row(table, row.min(table.rows.len() - 1));
+                        }
+                    }
+                    Some(TableSelectionMode::Column(col)) => {
+                        if table.column_widths.len() > 1 {
+                            changed =
+                                delete_table_column(table, col.min(table.column_widths.len() - 1));
+                        }
+                    }
+                    Some(TableSelectionMode::Table) => {
+                        if let Some(idx) = tab.document.content.iter().position(|block| {
+                            matches!(block, Block::Table(t) if t.id == table_id)
+                        }) {
+                            tab.document.content.remove(idx);
+                            changed = true;
+                            state.selected_table = None;
+                            state.table_selection_mode = None;
+                            state.table_selection_range = None;
+                        }
+                    }
+                    _ => {}
+                }
+                if changed {
+                    tab.document.dirty = true;
+                    tab.dirty = true;
+                }
+            }
+        }
+        if changed {
+            state.app_state.status_text = "Table structure updated".to_string();
+            return true;
+        }
+    }
+
+    if !(ctrl_down && shift_down) {
+        return false;
+    }
+
+    let row_col = table_selected_row_col(state);
+    let selected_cell = selected_table_cell(state);
+    let selection_range = state.table_selection_range.clone();
+    let mut changed = false;
+    let mut message = None::<String>;
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        if let Some(table) = find_table_mut(&mut tab.document, table_id) {
+            match vk {
+                0x55 => {
+                    if let Some((row, _)) = row_col {
+                        insert_row_above(table, row);
+                        changed = true;
+                        message = Some("Inserted row above".to_string());
+                    }
+                }
+                0x4A => {
+                    if let Some((row, _)) = row_col {
+                        insert_row_below(table, row);
+                        changed = true;
+                        message = Some("Inserted row below".to_string());
+                    }
+                }
+                0x48 => {
+                    if let Some((_, col)) = row_col {
+                        insert_column_left(table, col);
+                        changed = true;
+                        message = Some("Inserted column left".to_string());
+                    }
+                }
+                0x4B => {
+                    if let Some((_, col)) = row_col {
+                        insert_column_right(table, col);
+                        changed = true;
+                        message = Some("Inserted column right".to_string());
+                    }
+                }
+                0x4D => {
+                    if let Some(selection) = selection_range.clone() {
+                        changed = merge_table_cells(table, selection);
+                        if changed {
+                            message = Some("Merged selected cells".to_string());
+                        }
+                    }
+                }
+                0x53 => {
+                    if let Some(cell) = selected_cell {
+                        changed = split_table_cell(table, cell);
+                        if changed {
+                            message = Some("Split selected cell".to_string());
+                        }
+                    }
+                }
+                0x30 => {
+                    let total = table.column_widths.iter().sum::<f32>().max(300.0);
+                    distribute_columns_evenly(table, total);
+                    changed = true;
+                    message = Some("Distributed columns evenly".to_string());
+                }
+                0x39 => {
+                    let total = table.column_widths.iter().sum::<f32>().max(420.0);
+                    fit_columns_to_content(table, total);
+                    changed = true;
+                    message = Some("Auto-fit columns to content".to_string());
+                }
+                0x31 => {
+                    apply_table_style(table, TableStylePreset::Plain);
+                    changed = true;
+                    message = Some("Applied table style: Plain".to_string());
+                }
+                0x32 => {
+                    apply_table_style(table, TableStylePreset::Grid);
+                    changed = true;
+                    message = Some("Applied table style: Grid".to_string());
+                }
+                0x33 => {
+                    apply_table_style(table, TableStylePreset::HeaderAccent);
+                    changed = true;
+                    message = Some("Applied table style: Header row".to_string());
+                }
+                0x34 => {
+                    apply_table_style(table, TableStylePreset::AlternatingRows);
+                    changed = true;
+                    message = Some("Applied table style: Alternating rows".to_string());
+                }
+                0x35 => {
+                    apply_table_style(table, TableStylePreset::Professional);
+                    changed = true;
+                    message = Some("Applied table style: Professional".to_string());
+                }
+                _ => {}
+            }
+            if changed {
+                tab.document.dirty = true;
+                tab.dirty = true;
+            }
+        }
+    }
+
+    if changed {
+        state.app_state.status_text = message.unwrap_or_else(|| "Table updated".to_string());
+    }
+    changed
 }
 
 fn insert_image_from_path(
@@ -644,6 +1145,257 @@ fn collect_canvas_image_overlays(
 
     image_cache.mark_visible_hashes(visible_hashes.as_slice());
     overlays
+}
+
+fn collect_canvas_table_overlays(tab: &crate::ui::tabs::TabState) -> Vec<CanvasTableOverlay> {
+    let page_rect = tab
+        .canvas
+        .page_rects(&tab.document)
+        .first()
+        .copied()
+        .unwrap_or(UiRect {
+            x: 0.0,
+            y: 0.0,
+            width: tab.canvas.viewport.width.max(1.0),
+            height: tab.canvas.viewport.height.max(1.0),
+        });
+
+    let left = page_rect.x + 46.0;
+    let mut top = page_rect.y + 430.0;
+    let max_width = (page_rect.width - 92.0).max(140.0);
+    let mut overlays = Vec::new();
+
+    for block in &tab.document.content {
+        let Block::Table(table) = block else {
+            continue;
+        };
+        let rows = table.rows.len().max(1);
+        let cols = table.column_widths.len().max(1);
+        let gutter_w = 18.0;
+        let header_h = 18.0;
+        let cell_h = 24.0;
+        let cell_w = ((max_width - gutter_w) / cols as f32).max(28.0);
+        let visible = visible_row_range(table, tab.canvas.scroll.y.max(0.0), tab.canvas.viewport.height, cell_h);
+        let visible_rows = (visible.1.saturating_sub(visible.0)).max(1);
+        let total_h = header_h + visible_rows as f32 * cell_h;
+        let total_w = gutter_w + cell_w * cols as f32;
+        if top + total_h > page_rect.y + page_rect.height - 24.0 {
+            break;
+        }
+
+        overlays.push(CanvasTableOverlay {
+            table_id: table.id,
+            rect: UiRect {
+                x: left,
+                y: top,
+                width: total_w,
+                height: total_h,
+            },
+            rows,
+            cols,
+            cell_w,
+            cell_h,
+            header_h,
+            gutter_w,
+        });
+        top += total_h + 18.0;
+
+        if overlays.len() >= 8 {
+            break;
+        }
+    }
+
+    overlays
+}
+
+fn begin_table_interaction(state: &mut WindowState, point: UiPoint) -> bool {
+    let origin = canvas_origin(state);
+    let local = UiPoint {
+        x: point.x - origin.x,
+        y: point.y - origin.y,
+    };
+
+    let overlay = state
+        .canvas_table_overlays
+        .iter()
+        .rev()
+        .find(|overlay| contains_rect(overlay.rect, local))
+        .cloned();
+    let Some(overlay) = overlay else {
+        return false;
+    };
+
+    let local_x = local.x - overlay.rect.x;
+    let local_y = local.y - overlay.rect.y;
+    let rel_col = ((local_x - overlay.gutter_w) / overlay.cell_w).floor().max(0.0) as usize;
+    let rel_row = ((local_y - overlay.header_h) / overlay.cell_h).floor().max(0.0) as usize;
+    let col = rel_col.min(overlay.cols.saturating_sub(1));
+    let row = rel_row.min(overlay.rows.saturating_sub(1));
+
+    state.selected_table = Some(overlay.table_id);
+    state.selected_image = None;
+    state.image_drag = None;
+
+    if local_x <= overlay.gutter_w && local_y <= overlay.header_h {
+        state.table_selection_mode = Some(TableSelectionMode::Table);
+        state.table_selection_range = Some(TableSelection {
+            start: CellPos { row: 0, col: 0 },
+            end: CellPos {
+                row: overlay.rows.saturating_sub(1),
+                col: overlay.cols.saturating_sub(1),
+            },
+        });
+    } else if local_x <= overlay.gutter_w {
+        state.table_selection_mode = Some(TableSelectionMode::Row(row));
+        state.table_selection_range = Some(TableSelection {
+            start: CellPos { row, col: 0 },
+            end: CellPos {
+                row,
+                col: overlay.cols.saturating_sub(1),
+            },
+        });
+    } else if local_y <= overlay.header_h {
+        state.table_selection_mode = Some(TableSelectionMode::Column(col));
+        state.table_selection_range = Some(TableSelection {
+            start: CellPos { row: 0, col },
+            end: CellPos {
+                row: overlay.rows.saturating_sub(1),
+                col,
+            },
+        });
+    } else {
+        state.table_selection_mode = Some(TableSelectionMode::Cell(CellPos { row, col }));
+        state.table_selection_range = Some(TableSelection {
+            start: CellPos { row, col },
+            end: CellPos { row, col },
+        });
+    }
+
+    // Column/row border drag handles.
+    let near_col_border = if local_x > overlay.gutter_w {
+        let x = local_x - overlay.gutter_w;
+        let frac = (x / overlay.cell_w).fract();
+        frac < 0.08 || frac > 0.92
+    } else {
+        false
+    };
+    if near_col_border {
+        if let Some(table) = active_table_ref(state, overlay.table_id) {
+            let border_idx = ((local_x - overlay.gutter_w) / overlay.cell_w).round().max(0.0) as usize;
+            let col_idx = border_idx.min(overlay.cols.saturating_sub(1));
+            let start_value = table.column_widths.get(col_idx).copied().unwrap_or(120.0);
+            state.table_resize = Some(TableResizeState {
+                table_id: overlay.table_id,
+                row: None,
+                col: Some(col_idx),
+                start_mouse: local,
+                start_value,
+            });
+        }
+    } else if local_x <= overlay.gutter_w && local_y > overlay.header_h {
+        if let Some(table) = active_table_ref(state, overlay.table_id) {
+            let border_idx = ((local_y - overlay.header_h) / overlay.cell_h).round().max(0.0) as usize;
+            let row_idx = border_idx.min(overlay.rows.saturating_sub(1));
+            let start_value = table.row_heights.get(row_idx).copied().unwrap_or(28.0);
+            state.table_resize = Some(TableResizeState {
+                table_id: overlay.table_id,
+                row: Some(row_idx),
+                col: None,
+                start_mouse: local,
+                start_value,
+            });
+        }
+    } else {
+        state.table_resize = None;
+    }
+
+    state.app_state.status_text = format!("Table {} selected", overlay.table_id.0);
+    true
+}
+
+fn update_table_resize(state: &mut WindowState, point: UiPoint) -> bool {
+    let Some(resize) = state.table_resize.clone() else {
+        return false;
+    };
+    let origin = canvas_origin(state);
+    let local = UiPoint {
+        x: point.x - origin.x,
+        y: point.y - origin.y,
+    };
+    let dx = local.x - resize.start_mouse.x;
+    let dy = local.y - resize.start_mouse.y;
+
+    let mut changed = false;
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        if let Some(table) = find_table_mut(&mut tab.document, resize.table_id) {
+            if let Some(col) = resize.col {
+                changed = resize_table_column(table, col, resize.start_value + dx);
+            } else if let Some(row) = resize.row {
+                changed = resize_table_row(table, row, resize.start_value + dy);
+            }
+            if changed {
+                tab.document.dirty = true;
+                tab.dirty = true;
+            }
+        }
+    }
+    changed
+}
+
+fn selected_table_cell(state: &WindowState) -> Option<CellPos> {
+    match state.table_selection_mode {
+        Some(TableSelectionMode::Cell(cell)) => Some(cell),
+        Some(TableSelectionMode::Row(row)) => Some(CellPos { row, col: 0 }),
+        Some(TableSelectionMode::Column(col)) => Some(CellPos { row: 0, col }),
+        Some(TableSelectionMode::Table) | None => None,
+    }
+}
+
+fn navigate_table_cell(state: &mut WindowState, backwards: bool) -> bool {
+    let Some(table_id) = state.selected_table else {
+        return false;
+    };
+    let Some(current) = selected_table_cell(state) else {
+        return false;
+    };
+    let Some(table) = active_table_ref(state, table_id) else {
+        return false;
+    };
+    let rows = table.rows.len().max(1);
+    let cols = table.column_widths.len().max(1);
+    let mut row = current.row.min(rows.saturating_sub(1));
+    let mut col = current.col.min(cols.saturating_sub(1));
+
+    if backwards {
+        if col > 0 {
+            col -= 1;
+        } else if row > 0 {
+            row -= 1;
+            col = cols.saturating_sub(1);
+        }
+    } else if col + 1 < cols {
+        col += 1;
+    } else if row + 1 < rows {
+        row += 1;
+        col = 0;
+    } else {
+        if let Some(tab) = state.tabs.active_tab_mut() {
+            if let Some(table_mut) = find_table_mut(&mut tab.document, table_id) {
+                insert_row_below(table_mut, rows.saturating_sub(1));
+                tab.document.dirty = true;
+                tab.dirty = true;
+            }
+        }
+        row = rows;
+        col = 0;
+    }
+
+    state.table_selection_mode = Some(TableSelectionMode::Cell(CellPos { row, col }));
+    state.table_selection_range = Some(TableSelection {
+        start: CellPos { row, col },
+        end: CellPos { row, col },
+    });
+    true
 }
 
 fn image_drag_kind_for_point(rect: UiRect, point: UiPoint) -> ImageDragKind {
@@ -1295,6 +2047,7 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
     let mut canvas_scroll_x = 0.0f32;
     let mut canvas_scroll_y = 0.0f32;
     let mut canvas_images = Vec::new();
+    let mut canvas_tables = Vec::new();
     let mut current_block = None;
     let selected_image_id = state.selected_image;
 
@@ -1339,10 +2092,12 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
             current_block = Some(tab.cursor.primary.block_id);
             canvas_preview_lines = collect_preview_lines(&tab.document, 40);
             canvas_images = collect_canvas_image_overlays(tab, selected_image_id, image_cache);
+            canvas_tables = collect_canvas_table_overlays(tab);
         }
     }
     state.sidebar.set_current_outline_block(current_block);
     state.canvas_image_overlays = canvas_images.clone();
+    state.canvas_table_overlays = canvas_tables.clone();
     if let Some(renderer) = &mut state.renderer {
         renderer.update_image_cache_stats(state.image_cache.stats());
     }
@@ -1439,6 +2194,24 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
                 },
             )
         });
+    let selected_table_meta = state.selected_table.and_then(|id| {
+        active_table_ref(state, id).map(|table| {
+            let mode = match state.table_selection_mode {
+                Some(TableSelectionMode::Cell(cell)) => format!("Cell {},{}", cell.row + 1, cell.col + 1),
+                Some(TableSelectionMode::Row(row)) => format!("Row {}", row + 1),
+                Some(TableSelectionMode::Column(col)) => format!("Column {}", col + 1),
+                Some(TableSelectionMode::Table) => "Whole table".to_string(),
+                None => "No selection".to_string(),
+            };
+            (
+                id.0,
+                table.rows.len(),
+                table.column_widths.len(),
+                mode,
+                format!("{:?}", table.style),
+            )
+        })
+    });
 
     ShellRenderState {
         show_tabs: state.app_state.show_tabs,
@@ -1464,6 +2237,12 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         command_palette_query,
         command_palette_results,
         command_palette_selected,
+        table_picker_visible: state.table_picker_visible,
+        table_picker_rows: state.table_picker_rows,
+        table_picker_cols: state.table_picker_cols,
+        table_picker_custom_rows: state.table_picker_custom_rows.clone(),
+        table_picker_custom_cols: state.table_picker_custom_cols.clone(),
+        table_picker_custom_focus_rows: state.table_picker_custom_focus_rows,
         find_visible,
         replace_visible,
         find_query,
@@ -1519,6 +2298,59 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
             .as_ref()
             .map(|(_, _, _, alt)| alt.clone())
             .unwrap_or_default(),
+        canvas_tables: canvas_tables
+            .iter()
+            .map(|overlay| {
+                let selected = state.selected_table == Some(overlay.table_id);
+                let mut mode = 0u8;
+                if selected {
+                    mode = match state.table_selection_mode {
+                        Some(TableSelectionMode::Cell(_)) => 1,
+                        Some(TableSelectionMode::Row(_)) => 2,
+                        Some(TableSelectionMode::Column(_)) => 3,
+                        Some(TableSelectionMode::Table) => 4,
+                        None => 0,
+                    };
+                }
+                let selection = if selected {
+                    state.table_selection_range.clone()
+                } else {
+                    None
+                };
+                let (start_row, start_col, end_row, end_col) = selection
+                    .map(|sel| {
+                        (
+                            sel.start.row.min(sel.end.row),
+                            sel.start.col.min(sel.end.col),
+                            sel.start.row.max(sel.end.row),
+                            sel.start.col.max(sel.end.col),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0, 0));
+
+                crate::render::d2d::CanvasTableShellItem {
+                    table_id: overlay.table_id.0,
+                    rect: overlay.rect,
+                    rows: overlay.rows,
+                    cols: overlay.cols,
+                    cell_w: overlay.cell_w,
+                    cell_h: overlay.cell_h,
+                    header_h: overlay.header_h,
+                    gutter_w: overlay.gutter_w,
+                    selected,
+                    selection_mode: mode,
+                    selection_start_row: start_row,
+                    selection_start_col: start_col,
+                    selection_end_row: end_row,
+                    selection_end_col: end_col,
+                }
+            })
+            .collect(),
+        table_selected_meta: selected_table_meta
+            .as_ref()
+            .map(|(_, rows, cols, mode, style)| format!("{rows}x{cols} | {mode} | {style}"))
+            .unwrap_or_default(),
+        table_selected_id: selected_table_meta.map(|(id, _, _, _, _)| id).unwrap_or_default(),
     }
 }
 
@@ -1821,12 +2653,98 @@ unsafe extern "system" fn window_proc(
                             } else {
                                 state.app_state.status_text = "Insert image cancelled".to_string();
                             }
+                        } else if handled && state.app_state.status_text == "Insert table" {
+                            open_table_picker(state);
+                            state.app_state.status_text = "Insert table (picker)".to_string();
                         }
                     }
                     if handled {
                         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                         return LRESULT(0);
                     }
+                }
+
+                if state.table_picker_visible {
+                    match vk {
+                        0x1B => {
+                            state.table_picker_visible = false;
+                            state.app_state.status_text = "Insert table cancelled".to_string();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                        0x0D => {
+                            if let Some(id) = insert_table_from_picker(state) {
+                                state.app_state.status_text = format!(
+                                    "Inserted table {} ({}x{})",
+                                    id.0, state.table_picker_rows, state.table_picker_cols
+                                );
+                            } else {
+                                state.app_state.status_text = "Insert table failed".to_string();
+                            }
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                        0x09 => {
+                            state.table_picker_custom_focus_rows = !state.table_picker_custom_focus_rows;
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                        0x08 => {
+                            if state.table_picker_custom_focus_rows {
+                                remove_last_char(&mut state.table_picker_custom_rows);
+                                state.table_picker_rows = parse_table_picker_custom(
+                                    state.table_picker_custom_rows.as_str(),
+                                    state.table_picker_rows,
+                                )
+                                .clamp(1, 10);
+                                state.table_picker_custom_rows = state.table_picker_rows.to_string();
+                            } else {
+                                remove_last_char(&mut state.table_picker_custom_cols);
+                                state.table_picker_cols = parse_table_picker_custom(
+                                    state.table_picker_custom_cols.as_str(),
+                                    state.table_picker_cols,
+                                )
+                                .clamp(1, 10);
+                                state.table_picker_custom_cols = state.table_picker_cols.to_string();
+                            }
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                        0x25 => {
+                            state.table_picker_cols = state.table_picker_cols.saturating_sub(1).max(1);
+                            state.table_picker_custom_cols = state.table_picker_cols.to_string();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                        0x27 => {
+                            state.table_picker_cols = (state.table_picker_cols + 1).min(10);
+                            state.table_picker_custom_cols = state.table_picker_cols.to_string();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                        0x26 => {
+                            state.table_picker_rows = state.table_picker_rows.saturating_sub(1).max(1);
+                            state.table_picker_custom_rows = state.table_picker_rows.to_string();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                        0x28 => {
+                            state.table_picker_rows = (state.table_picker_rows + 1).min(10);
+                            state.table_picker_custom_rows = state.table_picker_rows.to_string();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !state.command_palette.is_open()
+                    && !state.find_replace.find_visible
+                    && !state.goto_visible
+                    && apply_table_shortcut(state, vk, ctrl_down, shift_down)
+                {
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
                 }
 
                 if ctrl_down
@@ -2201,6 +3119,28 @@ unsafe extern "system" fn window_proc(
         WM_CHAR => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
                 let code = wparam.0 as u32;
+                if state.table_picker_visible {
+                    if let Some(ch) = char::from_u32(code) {
+                        if ch.is_ascii_digit() {
+                            if state.table_picker_custom_focus_rows {
+                                state.table_picker_custom_rows.push(ch);
+                                state.table_picker_rows =
+                                    parse_table_picker_custom(state.table_picker_custom_rows.as_str(), 1)
+                                        .clamp(1, 10);
+                                state.table_picker_custom_rows = state.table_picker_rows.to_string();
+                            } else {
+                                state.table_picker_custom_cols.push(ch);
+                                state.table_picker_cols =
+                                    parse_table_picker_custom(state.table_picker_custom_cols.as_str(), 1)
+                                        .clamp(1, 10);
+                                state.table_picker_custom_cols = state.table_picker_cols.to_string();
+                            }
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                    }
+                }
+
                 if state.goto_visible {
                     if let Some(ch) = char::from_u32(code) {
                         if ch.is_ascii_digit() {
@@ -2288,6 +3228,12 @@ unsafe extern "system" fn window_proc(
         WM_MOUSEMOVE => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
                 let point = point_from_lparam(lparam);
+                if state.table_picker_visible {
+                    if update_table_picker_hover(state, point) {
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    }
+                    return LRESULT(0);
+                }
                 if state.sidebar_resizing {
                     let next_width =
                         (point.x + state.sidebar_resize_grab_offset).clamp(200.0, 400.0);
@@ -2302,6 +3248,10 @@ unsafe extern "system" fn window_proc(
                             (client.bottom - client.top).max(0) as f32,
                         );
                     }
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+                if state.table_resize.is_some() && update_table_resize(state, point) {
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
                 }
@@ -2334,6 +3284,12 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONDOWN => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
                 let point = point_from_lparam(lparam);
+                if state.table_picker_visible {
+                    if handle_table_picker_click(state, point) {
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+                }
                 if state.command_palette.is_open() {
                     let event = UiInputEvent::MouseDown(point);
                     if state.command_palette.handle_input(&event) {
@@ -2397,6 +3353,10 @@ unsafe extern "system" fn window_proc(
                                         state.app_state.status_text =
                                             "Insert image cancelled".to_string();
                                     }
+                                }
+                                ToolbarAction::InsertTable => {
+                                    open_table_picker(state);
+                                    state.app_state.status_text = "Insert table (picker)".to_string();
                                 }
                                 ToolbarAction::Paste => {
                                     if let Ok(id) = insert_image_from_clipboard(state) {
@@ -2471,6 +3431,12 @@ unsafe extern "system" fn window_proc(
                 if begin_image_interaction(state, point) {
                     handled = true;
                 }
+                if !handled && begin_table_interaction(state, point) {
+                    if state.table_resize.is_some() {
+                        let _ = unsafe { SetCapture(hwnd) };
+                    }
+                    handled = true;
+                }
 
                 if handled {
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
@@ -2489,6 +3455,12 @@ unsafe extern "system" fn window_proc(
                         "Sidebar width set to {:.0}px",
                         state.app_state.sidebar_width
                     );
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+                if state.table_resize.take().is_some() {
+                    let _ = unsafe { ReleaseCapture() };
+                    state.app_state.status_text = "Table resized".to_string();
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
                 }
