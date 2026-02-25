@@ -6,12 +6,16 @@ on:
       - "v*"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build:
+  windows-release:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -25,27 +29,44 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
-      - name: Build release binary
-        run: cargo build --release
-
-      - name: Create archive
+      - name: Install Inno Setup and WiX
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path target/release/doco.exe -DestinationPath dist/doco-windows-x64.zip -Force
+          choco install innosetup wixtoolset --no-progress -y
 
-      - name: Generate checksums
+      - name: Build release and package
         shell: pwsh
         run: |
-          Get-FileHash dist/doco-windows-x64.zip -Algorithm SHA256 | ForEach-Object {
-            "$($_.Hash)  doco-windows-x64.zip" | Out-File -FilePath dist/checksums.txt -Encoding ascii
+          .\scripts\release.ps1 -FetchPdfium
+
+      - name: Validate installer size target
+        shell: pwsh
+        run: |
+          $threshold = 15MB
+          Get-ChildItem dist -File | Where-Object { $_.Extension -in @('.exe', '.msi') } | ForEach-Object {
+            $sizeMb = [Math]::Round($_.Length / 1MB, 2)
+            Write-Host "$($_.Name): $sizeMb MB"
+            if ($_.Length -gt $threshold) {
+              Write-Warning "$($_.Name) exceeds 15 MB target."
+            }
           }
 
-      - name: Upload artifacts
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
           name: doco-release
           path: |
             dist/doco-windows-x64.zip
+            dist/Doco-Setup.exe
+            dist/Doco.msi
             dist/checksums.txt
 
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/doco-windows-x64.zip
+            dist/Doco-Setup.exe
+            dist/Doco.msi
+            dist/checksums.txt

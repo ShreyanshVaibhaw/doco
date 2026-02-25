@@ -4,3 +4,4 @@ dist/
 *.ilk
 *.log
 *.tmp
+pdfium.dll

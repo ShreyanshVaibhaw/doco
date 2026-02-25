@@ -11,6 +11,13 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of Doco is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="INSTALLDESKTOPSHORTCUT" Value="0" />
+    <Property Id="ADD_TO_PATH" Value="0" />
+
+    <UIRef Id="WixUI_InstallDir" />
+    <UIRef Id="WixUI_ErrorProgressText" />
+
     <Feature Id="ProductFeature" Title="Doco" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
     </Feature>
@@ -30,23 +37,57 @@
 
   <Fragment>
     <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
-      <Component Id="DocoExe" Guid="9A7AFD66-1B84-447A-91D5-307A7A23F5BB">
-        <File Source="..\..\target\release\doco.exe" KeyPath="yes" />
-      </Component>
-      <Component Id="PdfiumDll" Guid="442A6A0A-84CE-4282-B355-65FA86EF2D2E">
-        <File Source="..\..\pdfium.dll" />
+      <Component Id="DocoExeComponent" Guid="5BB8CF9B-7A6A-423E-BEA7-8C005CF5A7AA">
+        <File Id="DocoExeFile" Source="..\..\target\release\doco.exe" KeyPath="yes" />
       </Component>
 
-      <Component Id="ProgramMenuShortcut" Guid="0FE44A42-B150-4A71-B524-0450FE8A4305" Directory="ProgramMenuDir">
+      <Component Id="PdfiumDllComponent" Guid="442A6A0A-84CE-4282-B355-65FA86EF2D2E">
+        <File Source="..\..\pdfium.dll" KeyPath="yes" />
+      </Component>
+
+      <Component Id="StartMenuShortcutComponent" Guid="0FE44A42-B150-4A71-B524-0450FE8A4305" Directory="ProgramMenuDir">
         <Shortcut Id="ApplicationStartMenuShortcut"
                   Name="Doco"
-                  Description="Doco"
+                  Description="Doco document editor"
                   Target="[INSTALLFOLDER]doco.exe"
                   WorkingDirectory="INSTALLFOLDER" />
-        <RemoveFolder Id="ProgramMenuDir" On="uninstall" />
-        <RegistryValue Root="HKCU" Key="Software\Doco" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveFolder Id="ProgramMenuDirCleanup" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\Doco" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="DesktopShortcutComponent" Guid="E27D2E09-12F8-4E80-A9C0-9369F35CA6B8" Directory="DesktopFolder">
+        <Condition>INSTALLDESKTOPSHORTCUT=1</Condition>
+        <Shortcut Id="ApplicationDesktopShortcut"
+                  Name="Doco"
+                  Description="Doco document editor"
+                  Target="[INSTALLFOLDER]doco.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\Doco" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="FileAssociationComponent" Guid="3B6A5007-AB17-44A8-B495-2995257E8C1B">
+        <RegistryValue Root="HKCR" Key=".docx" Type="string" Value="Doco.Document" KeyPath="yes" />
+        <RegistryValue Root="HKCR" Key=".pdf" Type="string" Value="Doco.Document" />
+        <RegistryValue Root="HKCR" Key=".txt" Type="string" Value="Doco.Document" />
+        <RegistryValue Root="HKCR" Key=".md" Type="string" Value="Doco.Document" />
+        <RegistryValue Root="HKCR" Key="Doco.Document" Type="string" Value="Doco Document" />
+        <RegistryValue Root="HKCR" Key="Doco.Document\DefaultIcon" Type="string" Value="[INSTALLFOLDER]doco.exe,0" />
+        <RegistryValue Root="HKCR" Key="Doco.Document\shell\open\command" Type="string" Value="&quot;[INSTALLFOLDER]doco.exe&quot; &quot;%1&quot;" />
+        <RegistryValue Root="HKCR" Key="*\shell\Open with Doco" Type="string" Value="Open with Doco" />
+        <RegistryValue Root="HKCR" Key="*\shell\Open with Doco\command" Type="string" Value="&quot;[INSTALLFOLDER]doco.exe&quot; &quot;%1&quot;" />
+      </Component>
+
+      <Component Id="PathComponent" Guid="E61F7465-6594-4B6E-BB89-55A2F8C0DCCB">
+        <Condition>ADD_TO_PATH=1</Condition>
+        <RegistryValue Root="HKLM" Key="Software\Doco" Name="PathAdded" Type="integer" Value="1" KeyPath="yes" />
+        <Environment Id="DocoPathEntry"
+                     Name="PATH"
+                     Value="[INSTALLFOLDER]"
+                     Action="set"
+                     Part="last"
+                     Permanent="no"
+                     System="yes" />
       </Component>
     </ComponentGroup>
   </Fragment>
 </Wix>
-
