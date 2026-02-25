@@ -319,6 +319,46 @@ pub fn pick_image_file(hwnd: HWND) -> Option<PathBuf> {
     Some(PathBuf::from(path))
 }
 
+pub fn pick_open_file(hwnd: HWND) -> Option<PathBuf> {
+    let mut file_buffer = vec![0u16; 260];
+    let mut filter = String::new();
+    filter.push_str("Supported Documents (*.docx;*.txt;*.md;*.rtf;*.pdf)\0");
+    filter.push_str("*.docx;*.txt;*.md;*.rtf;*.pdf\0");
+    filter.push_str("Word Document (*.docx)\0*.docx\0");
+    filter.push_str("Text Document (*.txt)\0*.txt\0");
+    filter.push_str("Markdown (*.md)\0*.md\0");
+    filter.push_str("PDF (*.pdf)\0*.pdf\0");
+    filter.push_str("All Files (*.*)\0*.*\0\0");
+    let filter_wide = filter.encode_utf16().collect::<Vec<u16>>();
+
+    let mut open = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: windows::core::PCWSTR::from_raw(filter_wide.as_ptr()),
+        lpstrFile: windows::core::PWSTR(file_buffer.as_mut_ptr()),
+        nMaxFile: file_buffer.len() as u32,
+        lpstrTitle: w!("Open Document"),
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+        ..Default::default()
+    };
+
+    let ok = unsafe { GetOpenFileNameW(&mut open).as_bool() };
+    if !ok {
+        return None;
+    }
+
+    let len = file_buffer
+        .iter()
+        .position(|c| *c == 0)
+        .unwrap_or(file_buffer.len());
+    if len == 0 {
+        return None;
+    }
+
+    let path = OsString::from_wide(&file_buffer[..len]);
+    Some(PathBuf::from(path))
+}
+
 pub fn pick_save_file(
     hwnd: HWND,
     suggested_name: &str,

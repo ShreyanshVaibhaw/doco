@@ -488,7 +488,46 @@ pub fn save_with_format(path: &Path, model: &DocumentModel) -> std::io::Result<(
         "md" | "markdown" => export_markdown(path, model),
         "html" | "htm" => export_html(path, model),
         "rtf" => export_rtf(path, model),
-        _ => save_docx(path, model),
+        _ => export_txt(path, model),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::save_with_format;
+    use crate::document::model::{
+        Block, BlockId, DocumentModel, Indent, Paragraph, ParagraphAlignment, ParagraphSpacing, Run, RunStyle,
+    };
+
+    #[test]
+    fn save_unknown_extension_falls_back_to_plain_text() {
+        let mut model = DocumentModel::default();
+        model.content.push(Block::Paragraph(Paragraph {
+            id: BlockId(1),
+            runs: vec![Run {
+                text: "hello".to_string(),
+                style: RunStyle::default(),
+            }],
+            alignment: ParagraphAlignment::Left,
+            spacing: ParagraphSpacing::default(),
+            indent: Indent::default(),
+            style_id: None,
+        }));
+
+        let path = std::env::temp_dir().join(format!(
+            "doco-save-fallback-{}-{}.ini",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+
+        save_with_format(path.as_path(), &model).expect("save should succeed");
+        let written = std::fs::read_to_string(path.as_path()).expect("read should succeed");
+        let _ = std::fs::remove_file(path.as_path());
+
+        assert_eq!(written, "hello\n");
     }
 }
 

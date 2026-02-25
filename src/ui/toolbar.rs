@@ -570,6 +570,10 @@ impl Toolbar {
         self.button_rects.get(index).copied()
     }
 
+    pub fn button_rects(&self) -> &[Rect] {
+        &self.button_rects
+    }
+
     pub fn hit_button_part(&self, point: Point) -> Option<(usize, ToolbarHitPart)> {
         if !self.visible {
             return None;

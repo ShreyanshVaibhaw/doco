@@ -11,7 +11,8 @@ use windows::{
                 Common::{D2D_RECT_F, D2D1_ALPHA_MODE_IGNORE, D2D1_PIXEL_FORMAT},
                 D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET,
                 D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
-                D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1CreateFactory,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE,
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1CreateFactory,
                 ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image,
                 ID2D1SolidColorBrush,
             },
@@ -22,7 +23,8 @@ use windows::{
             },
             DirectWrite::{
                 DWRITE_FACTORY_TYPE_SHARED, DWRITE_MEASURING_MODE_NATURAL, DWriteCreateFactory,
-                IDWriteFactory, IDWriteTextFormat,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
+                DWRITE_WORD_WRAPPING_NO_WRAP, IDWriteFactory, IDWriteTextFormat,
             },
             Dxgi::{
                 Common::{
@@ -52,6 +54,7 @@ use crate::{
 };
 
 const D2DERR_RECREATE_TARGET: HRESULT = HRESULT(0x8899000C_u32 as i32);
+const LAYOUT_DPI: f32 = 96.0;
 
 #[derive(Debug, Clone, Default)]
 pub struct CanvasImageShellItem {
@@ -89,6 +92,15 @@ pub struct ToastShellItem {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct ToolbarShellButton {
+    pub rect: UiRect,
+    pub label: String,
+    pub icon: String,
+    pub active: bool,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ShellRenderState {
     pub ui_scale: f32,
     pub show_tabs: bool,
@@ -104,7 +116,7 @@ pub struct ShellRenderState {
     pub tab_transition_offset: f32,
     pub tab_has_overflow_left: bool,
     pub tab_has_overflow_right: bool,
-    pub toolbar_labels: Vec<String>,
+    pub toolbar_buttons: Vec<ToolbarShellButton>,
     pub toolbar_dropdown_open: bool,
     pub toolbar_dropdown_opacity: f32,
     pub toolbar_dropdown_scale: f32,
@@ -193,6 +205,7 @@ pub struct D2DRenderer {
     debug_panel: DebugPerformancePanel,
     brush_cache: RefCell<HashMap<u32, ID2D1SolidColorBrush>>,
     default_text_format: RefCell<Option<IDWriteTextFormat>>,
+    icon_text_format: RefCell<Option<IDWriteTextFormat>>,
 }
 
 impl D2DRenderer {
@@ -230,6 +243,7 @@ impl D2DRenderer {
                 debug_panel: DebugPerformancePanel::default(),
                 brush_cache: RefCell::new(HashMap::new()),
                 default_text_format: RefCell::new(None),
+                icon_text_format: RefCell::new(None),
             };
 
             renderer.recreate_target_bitmap()?;
@@ -340,7 +354,7 @@ impl D2DRenderer {
     pub fn set_dpi(&mut self, dpi: f32) {
         self.dpi = dpi;
         unsafe {
-            let _ = self.d2d_context.SetDpi(dpi, dpi);
+            let _ = self.d2d_context.SetDpi(LAYOUT_DPI, LAYOUT_DPI);
         }
     }
 
@@ -535,74 +549,78 @@ impl D2DRenderer {
             let text_brush = self.create_brush(text_color)?;
             let text_format = self.create_text_format()?;
             if sidebar_w > 0.0 {
-                let files = "Files".encode_utf16().collect::<Vec<u16>>();
-                self.d2d_context.DrawText(
-                    &files,
-                    &text_format,
-                    &D2D_RECT_F {
-                        left: 14.0,
-                        top: tab_h + 8.0,
-                        right: sidebar_w - 8.0,
-                        bottom: tab_h + 32.0,
-                    },
-                    &text_brush,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+                let tab_titles = [
+                    ("Files", "Files"),
+                    ("Outline", "Outline"),
+                    ("Marks", "Bookmarks"),
+                    ("Search", "Search Results"),
+                ];
+                let tab_w = sidebar_w / tab_titles.len() as f32;
+                for (idx, (title, panel_key)) in tab_titles.iter().enumerate() {
+                    let x = idx as f32 * tab_w;
+                    let tab_rect = D2D_RECT_F {
+                        left: x,
+                        top: tab_h,
+                        right: (x + tab_w).min(sidebar_w),
+                        bottom: tab_h + 34.0,
+                    };
+                    let is_active = shell
+                        .active_sidebar_panel
+                        .eq_ignore_ascii_case(panel_key);
+                    if is_active {
+                        let bg = self.create_brush(self.theme.surface_hover.as_d2d())?;
+                        self.d2d_context.FillRectangle(&tab_rect, &bg);
+                    }
+                    let text = title.encode_utf16().collect::<Vec<u16>>();
+                    self.d2d_context.DrawText(
+                        &text,
+                        &text_format,
+                        &tab_rect,
+                        &text_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    if idx + 1 < tab_titles.len() {
+                        let divider = self.create_brush(self.theme.border_subtle.as_d2d())?;
+                        self.d2d_context.DrawLine(
+                            Vector2 {
+                                X: tab_rect.right,
+                                Y: tab_rect.top + 5.0,
+                            },
+                            Vector2 {
+                                X: tab_rect.right,
+                                Y: tab_rect.bottom - 5.0,
+                            },
+                            &divider,
+                            1.0,
+                            None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                        );
+                    }
+                }
 
-                let active_panel = shell
-                    .active_sidebar_panel
-                    .encode_utf16()
-                    .collect::<Vec<u16>>();
-                self.d2d_context.DrawText(
-                    &active_panel,
-                    &text_format,
-                    &D2D_RECT_F {
-                        left: 14.0,
-                        top: tab_h + 30.0,
-                        right: sidebar_w - 8.0,
-                        bottom: tab_h + 52.0,
-                    },
-                    &text_brush,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
-
-                let summary = shell.sidebar_summary.encode_utf16().collect::<Vec<u16>>();
-                self.d2d_context.DrawText(
-                    &summary,
-                    &text_format,
-                    &D2D_RECT_F {
-                        left: 14.0,
-                        top: tab_h + 52.0,
-                        right: sidebar_w - 8.0,
-                        bottom: tab_h + 72.0,
-                    },
-                    &text_brush,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
-
-                let mut row_y = tab_h + 76.0;
+                let panel_top = tab_h + 34.0;
+                let panel_bottom = (height - status_h).max(panel_top);
+                let mut row_y = panel_top;
                 for row in shell.sidebar_rows.iter().take(24) {
+                    let row_bottom = row_y + 24.0;
+                    if row_bottom > panel_bottom {
+                        break;
+                    }
                     let row_utf16 = row.encode_utf16().collect::<Vec<u16>>();
                     self.d2d_context.DrawText(
                         &row_utf16,
                         &text_format,
                         &D2D_RECT_F {
-                            left: 14.0,
+                            left: 10.0,
                             top: row_y,
                             right: sidebar_w - 8.0,
-                            bottom: row_y + 20.0,
+                            bottom: row_bottom,
                         },
                         &text_brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
-                    row_y += 20.0;
-                    if row_y > height - status_h - 12.0 {
-                        break;
-                    }
+                    row_y += 24.0;
                 }
             }
 
@@ -1473,8 +1491,17 @@ impl D2DRenderer {
                 );
             }
 
-            let status = shell.status_text.encode_utf16().collect::<Vec<u16>>();
             if status_h > 0.0 {
+                let status_left_text = if shell.status_text.trim().is_empty() {
+                    shell.status_left.clone()
+                } else if shell.status_left.trim().is_empty()
+                    || shell.status_left.eq_ignore_ascii_case(&shell.status_text)
+                {
+                    shell.status_text.clone()
+                } else {
+                    format!("{} | {}", shell.status_text, shell.status_left)
+                };
+                let status = status_left_text.encode_utf16().collect::<Vec<u16>>();
                 self.d2d_context.DrawText(
                     &status,
                     &text_format,
@@ -1497,21 +1524,6 @@ impl D2DRenderer {
                         left: width - 420.0,
                         top: height - status_h + 4.0,
                         right: width - 10.0,
-                        bottom: height - 2.0,
-                    },
-                    &text_brush,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
-
-                let status_left = shell.status_left.encode_utf16().collect::<Vec<u16>>();
-                self.d2d_context.DrawText(
-                    &status_left,
-                    &text_format,
-                    &D2D_RECT_F {
-                        left: 14.0,
-                        top: height - status_h + 4.0,
-                        right: (width - 440.0).max(100.0),
                         bottom: height - 2.0,
                     },
                     &text_brush,
@@ -1662,27 +1674,81 @@ impl D2DRenderer {
                 }
             }
 
-            if toolbar_h > 0.0 && !shell.toolbar_labels.is_empty() {
-                let mut x = sidebar_w + 12.0;
-                for label in shell.toolbar_labels.iter().take(12) {
-                    let t = label.encode_utf16().collect::<Vec<u16>>();
+            if toolbar_h > 0.0 && !shell.toolbar_buttons.is_empty() {
+                let button_bg = self.create_brush(self.theme.surface_secondary.as_d2d())?;
+                let button_active_bg = self.create_brush(self.theme.surface_hover.as_d2d())?;
+                let button_disabled_bg = self.create_brush(self.theme.surface_primary.as_d2d())?;
+                let button_border = self.create_brush(self.theme.border_default.as_d2d())?;
+                let text_disabled = self.create_brush(self.theme.text_secondary.as_d2d())?;
+                let separator_brush = self.create_brush(self.theme.border_subtle.as_d2d())?;
+                let icon_format = self.create_icon_text_format()?;
+                for button in shell.toolbar_buttons.iter() {
+                    let rect = D2D_RECT_F {
+                        left: button.rect.x,
+                        top: button.rect.y,
+                        right: button.rect.x + button.rect.width,
+                        bottom: button.rect.y + button.rect.height,
+                    };
+
+                    if button.label.trim().is_empty() && button.icon.trim().is_empty() && button.rect.width <= 12.0
+                    {
+                        let center = button.rect.x + (button.rect.width * 0.5);
+                        self.d2d_context.DrawLine(
+                            Vector2 {
+                                X: center,
+                                Y: rect.top + 4.0,
+                            },
+                            Vector2 {
+                                X: center,
+                                Y: rect.bottom - 4.0,
+                            },
+                            &separator_brush,
+                            1.0,
+                            None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                        );
+                        continue;
+                    }
+
+                    let bg = if !button.enabled {
+                        &button_disabled_bg
+                    } else if button.active {
+                        &button_active_bg
+                    } else {
+                        &button_bg
+                    };
+                    self.d2d_context.FillRectangle(&rect, bg);
+                    self.d2d_context.DrawRectangle(
+                        &rect,
+                        &button_border,
+                        1.0,
+                        None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                    );
+
+                    let is_icon_only = button.label.trim().is_empty() && !button.icon.trim().is_empty();
+                    let caption = if is_icon_only {
+                        button.icon.as_str()
+                    } else if button.label.trim().is_empty() {
+                        ""
+                    } else {
+                        button.label.as_str()
+                    };
+                    if caption.is_empty() {
+                        continue;
+                    }
+                    let t = caption.encode_utf16().collect::<Vec<u16>>();
                     self.d2d_context.DrawText(
                         &t,
-                        &text_format,
+                        if is_icon_only { &icon_format } else { &text_format },
                         &D2D_RECT_F {
-                            left: x,
-                            top: tab_h + 11.0,
-                            right: x + 80.0,
-                            bottom: tab_h + toolbar_h - 6.0,
+                            left: rect.left + 6.0,
+                            top: rect.top + if is_icon_only { 2.0 } else { 4.0 },
+                            right: rect.right - 6.0,
+                            bottom: rect.bottom - 4.0,
                         },
-                        &text_brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        if button.enabled { &text_brush } else { &text_disabled },
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
-                    x += 74.0;
-                    if x > width - 70.0 {
-                        break;
-                    }
                 }
             }
 
@@ -2686,8 +2752,54 @@ impl D2DRenderer {
                     w!("en-US"),
                 )?,
             };
+            let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
             *self.default_text_format.borrow_mut() = Some(format.clone());
+            Ok(format)
+        }
+    }
+
+    fn create_icon_text_format(&self) -> Result<IDWriteTextFormat> {
+        if let Some(existing) = self.icon_text_format.borrow().as_ref() {
+            return Ok(existing.clone());
+        }
+
+        unsafe {
+            let format = match self.dwrite_factory.CreateTextFormat(
+                w!("Segoe Fluent Icons"),
+                None,
+                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL,
+                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE_NORMAL,
+                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STRETCH_NORMAL,
+                13.0,
+                w!("en-US"),
+            ) {
+                Ok(format) => format,
+                Err(_) => match self.dwrite_factory.CreateTextFormat(
+                    w!("Segoe MDL2 Assets"),
+                    None,
+                    windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL,
+                    windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE_NORMAL,
+                    windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STRETCH_NORMAL,
+                    13.0,
+                    w!("en-US"),
+                ) {
+                    Ok(format) => format,
+                    Err(_) => self.dwrite_factory.CreateTextFormat(
+                        w!("Segoe UI Symbol"),
+                        None,
+                        windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL,
+                        windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE_NORMAL,
+                        windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STRETCH_NORMAL,
+                        13.0,
+                        w!("en-US"),
+                    )?,
+                },
+            };
+            let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            *self.icon_text_format.borrow_mut() = Some(format.clone());
             Ok(format)
         }
     }
@@ -2722,8 +2834,8 @@ impl D2DRenderer {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 alphaMode: D2D1_ALPHA_MODE_IGNORE,
             },
-            dpiX: self.dpi,
-            dpiY: self.dpi,
+            dpiX: LAYOUT_DPI,
+            dpiY: LAYOUT_DPI,
             bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
             colorContext: ManuallyDrop::new(None),
         };
@@ -2735,7 +2847,7 @@ impl D2DRenderer {
 
         unsafe {
             self.d2d_context.SetTarget(&bitmap);
-            let _ = self.d2d_context.SetDpi(self.dpi, self.dpi);
+            let _ = self.d2d_context.SetDpi(LAYOUT_DPI, LAYOUT_DPI);
         }
         self.target_bitmap = Some(bitmap);
         self.brush_cache.borrow_mut().clear();

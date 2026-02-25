@@ -48,12 +48,14 @@ use crate::{
         markdown::MarkdownDocument,
         model::{
             Block, BlockId, DocumentModel, ImageAlignment, ImageBorder, ImageBorderStyle,
+            Indent, Paragraph, ParagraphAlignment, ParagraphSpacing, Run, RunStyle,
             TableStylePreset,
         },
         txt::TextDocument,
     },
     editor::{
-        clipboard::read_clipboard_image,
+        clipboard::{get_plain_text, read_clipboard_image, set_plain_text},
+        cursor::Movement,
         image_ops::load_supported_image,
         search::{FindReplaceState, replace_all, replace_current, replacement_preview},
         table::{
@@ -95,12 +97,15 @@ use crate::{
         statusbar::{StatusAction, StatusBar, StatusBarInfo},
         tabs::{TabKind, TabsBar},
         toast::Toast,
-        toolbar::{Toolbar, ToolbarAction},
+        toolbar::{
+            AlignmentState, HeadingState, ListState, ToggleState, Toolbar, ToolbarAction,
+            ToolbarFormatState, ToolbarIntent,
+        },
     },
     window::integration::{
         DropAction, JumpListState, PrintState, extract_drop_payload, parse_startup_files_from_cli,
-        pick_image_file, pick_save_file, open_print_dialog, query_accessibility_preferences,
-        send_toast_notification,
+        open_print_dialog, pick_image_file, pick_open_file, pick_save_file,
+        query_accessibility_preferences, send_toast_notification,
     },
 };
 
@@ -438,7 +443,10 @@ fn load_document_for_path(path: &Path) -> DocumentModel {
         DocumentFormat::Text => TextDocument::load_from_path(path)
             .map(|doc| doc.to_document_model())
             .unwrap_or_default(),
-        DocumentFormat::Pdf | DocumentFormat::Unknown => DocumentModel::default(),
+        DocumentFormat::Pdf => DocumentModel::default(),
+        DocumentFormat::Unknown => TextDocument::load_from_path(path)
+            .map(|doc| doc.to_document_model())
+            .unwrap_or_default(),
     };
 
     model.metadata.file_path = Some(path.to_path_buf());
@@ -801,6 +809,16 @@ fn open_path_from_sidebar(state: &mut WindowState, path: PathBuf, new_tab: bool)
     }
     state.app_state.status_text = format!("Opened {title}");
     sync_sidebar_with_active_tab(state);
+}
+
+fn open_file_via_picker(state: &mut WindowState, hwnd: HWND, new_tab: bool) -> bool {
+    let Some(path) = pick_open_file(hwnd) else {
+        state.app_state.status_text = "Open cancelled".to_string();
+        return true;
+    };
+    open_path_from_sidebar(state, path.clone(), new_tab);
+    state.jump_list.add_recent_file(path);
+    true
 }
 
 fn apply_pending_sidebar_intents(state: &mut WindowState) -> bool {
@@ -2007,6 +2025,1031 @@ fn remove_last_char(text: &mut String) {
     let _ = text.pop();
 }
 
+fn byte_index_from_char_offset(text: &str, char_offset: usize) -> usize {
+    text.char_indices()
+        .nth(char_offset)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
+}
+
+fn remove_char_at(text: &mut String, char_offset: usize) -> bool {
+    let start = byte_index_from_char_offset(text, char_offset);
+    if start >= text.len() {
+        return false;
+    }
+    let Some(ch) = text[start..].chars().next() else {
+        return false;
+    };
+    let end = start + ch.len_utf8();
+    text.replace_range(start..end, "");
+    true
+}
+
+fn text_block_char_len(block: &Block) -> Option<usize> {
+    match block {
+        Block::Paragraph(p) => Some(p.runs.iter().map(|r| r.text.chars().count()).sum()),
+        Block::Heading(h) => Some(h.runs.iter().map(|r| r.text.chars().count()).sum()),
+        Block::CodeBlock(c) => Some(c.code.chars().count()),
+        _ => None,
+    }
+}
+
+fn text_block_id(block: &Block) -> Option<BlockId> {
+    match block {
+        Block::Paragraph(p) => Some(p.id),
+        Block::Heading(h) => Some(h.id),
+        Block::CodeBlock(c) => Some(c.id),
+        _ => None,
+    }
+}
+
+fn find_block_index_by_id(document: &DocumentModel, block_id: BlockId) -> Option<usize> {
+    document.content.iter().position(|block| match block {
+        Block::Paragraph(p) => p.id == block_id,
+        Block::Heading(h) => h.id == block_id,
+        Block::CodeBlock(c) => c.id == block_id,
+        Block::Image(i) => i.id == block_id,
+        Block::Table(t) => t.id == block_id,
+        Block::BlockQuote(q) => q.id == block_id,
+        Block::List(list) => list.items.iter().any(|item| item.id == block_id),
+        Block::PageBreak | Block::HorizontalRule => false,
+    })
+}
+
+fn default_paragraph_with_style(id: BlockId, style: &RunStyle, text: String) -> Block {
+    Block::Paragraph(Paragraph {
+        id,
+        runs: vec![Run {
+            text,
+            style: style.clone(),
+        }],
+        alignment: ParagraphAlignment::Left,
+        spacing: ParagraphSpacing::default(),
+        indent: Indent::default(),
+        style_id: None,
+    })
+}
+
+fn ensure_single_run(runs: &mut Vec<Run>, default_style: &RunStyle) {
+    if runs.is_empty() {
+        runs.push(Run {
+            text: String::new(),
+            style: default_style.clone(),
+        });
+        return;
+    }
+    if runs.len() == 1 {
+        return;
+    }
+
+    let text = runs.iter().map(|r| r.text.as_str()).collect::<String>();
+    let style = runs
+        .first()
+        .map(|r| r.style.clone())
+        .unwrap_or_else(|| default_style.clone());
+    runs.clear();
+    runs.push(Run { text, style });
+}
+
+fn run_style_from_toolbar(format: &ToolbarFormatState) -> RunStyle {
+    RunStyle {
+        font_family: if format.font_family.trim().is_empty() {
+            None
+        } else {
+            Some(format.font_family.clone())
+        },
+        font_size: Some(format.font_size.max(1.0)),
+        bold: format.bold.is_on(),
+        italic: format.italic.is_on(),
+        underline: format.underline.is_on(),
+        strikethrough: format.strikethrough.is_on(),
+        color: format.text_color,
+        background: format.highlight_color,
+        superscript: format.superscript.is_on(),
+        subscript: format.subscript.is_on(),
+    }
+}
+
+fn ensure_editable_cursor_block(tab: &mut crate::ui::tabs::TabState, default_style: &RunStyle) -> usize {
+    if tab.document.content.is_empty() {
+        let id = tab.document.next_block_id();
+        tab.document
+            .content
+            .push(default_paragraph_with_style(id, default_style, String::new()));
+        tab.cursor.primary.block_id = id;
+        tab.cursor.primary.offset = 0;
+        return 0;
+    }
+
+    if let Some(idx) = find_block_index_by_id(&tab.document, tab.cursor.primary.block_id) {
+        if let Some(len) = text_block_char_len(&tab.document.content[idx]) {
+            tab.cursor.primary.offset = tab.cursor.primary.offset.min(len);
+            return idx;
+        }
+
+        let id = tab.document.next_block_id();
+        let insert_at = (idx + 1).min(tab.document.content.len());
+        tab.document.content.insert(
+            insert_at,
+            default_paragraph_with_style(id, default_style, String::new()),
+        );
+        tab.cursor.primary.block_id = id;
+        tab.cursor.primary.offset = 0;
+        return insert_at;
+    }
+
+    if let Some((idx, id, len)) = tab
+        .document
+        .content
+        .iter()
+        .enumerate()
+        .find_map(|(idx, block)| {
+            let len = text_block_char_len(block)?;
+            let id = text_block_id(block)?;
+            Some((idx, id, len))
+        })
+    {
+        tab.cursor.primary.block_id = id;
+        tab.cursor.primary.offset = tab.cursor.primary.offset.min(len);
+        return idx;
+    }
+
+    let id = tab.document.next_block_id();
+    let insert_at = tab.document.content.len();
+    tab.document
+        .content
+        .push(default_paragraph_with_style(id, default_style, String::new()));
+    tab.cursor.primary.block_id = id;
+    tab.cursor.primary.offset = 0;
+    insert_at
+}
+
+fn collect_text_block_lengths(document: &DocumentModel) -> Vec<(BlockId, usize)> {
+    document
+        .content
+        .iter()
+        .filter_map(|block| Some((text_block_id(block)?, text_block_char_len(block)?)))
+        .collect()
+}
+
+fn active_block_plain_text(tab: &crate::ui::tabs::TabState) -> Option<String> {
+    let idx = find_block_index_by_id(&tab.document, tab.cursor.primary.block_id)?;
+    match &tab.document.content[idx] {
+        Block::Paragraph(p) => Some(p.runs.iter().map(|r| r.text.as_str()).collect()),
+        Block::Heading(h) => Some(h.runs.iter().map(|r| r.text.as_str()).collect()),
+        Block::CodeBlock(c) => Some(c.code.clone()),
+        _ => None,
+    }
+}
+
+fn copy_active_block_to_clipboard(state: &WindowState) -> bool {
+    let Some(tab) = state.tabs.active_tab() else {
+        return false;
+    };
+    let Some(text) = active_block_plain_text(tab) else {
+        return false;
+    };
+    set_plain_text(text.as_str()).is_ok()
+}
+
+fn cut_active_block_to_clipboard(state: &mut WindowState) -> bool {
+    if !copy_active_block_to_clipboard(state) {
+        return false;
+    }
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    let Some(tab) = state.tabs.active_tab_mut() else {
+        return false;
+    };
+    let idx = ensure_editable_cursor_block(tab, &default_style);
+    let mut changed = false;
+
+    match &mut tab.document.content[idx] {
+        Block::Paragraph(p) => {
+            ensure_single_run(&mut p.runs, &default_style);
+            p.runs[0].text.clear();
+            changed = true;
+        }
+        Block::Heading(h) => {
+            ensure_single_run(&mut h.runs, &default_style);
+            h.runs[0].text.clear();
+            changed = true;
+        }
+        Block::CodeBlock(c) => {
+            c.code.clear();
+            changed = true;
+        }
+        _ => {}
+    }
+
+    if changed {
+        tab.cursor.primary.offset = 0;
+        tab.document.dirty = true;
+        tab.dirty = true;
+    }
+    changed
+}
+
+fn paste_text_from_clipboard_at_cursor(state: &mut WindowState) -> bool {
+    match get_plain_text() {
+        Ok(Some(text)) => insert_text_at_cursor(state, text.as_str()),
+        _ => false,
+    }
+}
+
+fn insert_text_at_cursor(state: &mut WindowState, text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    let mut changed = false;
+
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let idx = ensure_editable_cursor_block(tab, &default_style);
+        match &mut tab.document.content[idx] {
+            Block::Paragraph(p) => {
+                ensure_single_run(&mut p.runs, &default_style);
+                let run = &mut p.runs[0];
+                if run.text.is_empty() {
+                    run.style = default_style.clone();
+                }
+                let offset = tab.cursor.primary.offset.min(run.text.chars().count());
+                let at = byte_index_from_char_offset(run.text.as_str(), offset);
+                run.text.insert_str(at, text);
+                tab.cursor.primary.offset = offset + text.chars().count();
+                changed = true;
+            }
+            Block::Heading(h) => {
+                ensure_single_run(&mut h.runs, &default_style);
+                let run = &mut h.runs[0];
+                if run.text.is_empty() {
+                    run.style = default_style.clone();
+                }
+                let offset = tab.cursor.primary.offset.min(run.text.chars().count());
+                let at = byte_index_from_char_offset(run.text.as_str(), offset);
+                run.text.insert_str(at, text);
+                tab.cursor.primary.offset = offset + text.chars().count();
+                changed = true;
+            }
+            Block::CodeBlock(c) => {
+                let offset = tab.cursor.primary.offset.min(c.code.chars().count());
+                let at = byte_index_from_char_offset(c.code.as_str(), offset);
+                c.code.insert_str(at, text);
+                tab.cursor.primary.offset = offset + text.chars().count();
+                changed = true;
+            }
+            _ => {}
+        }
+
+        if changed {
+            tab.document.dirty = true;
+            tab.dirty = true;
+        }
+    }
+
+    changed
+}
+
+fn delete_backward_at_cursor(state: &mut WindowState) -> bool {
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let idx = ensure_editable_cursor_block(tab, &default_style);
+        let blocks = collect_text_block_lengths(&tab.document);
+        let current_pos = blocks
+            .iter()
+            .position(|(id, _)| *id == tab.cursor.primary.block_id)
+            .unwrap_or(0);
+
+        let mut changed = false;
+        match &mut tab.document.content[idx] {
+            Block::Paragraph(p) => {
+                ensure_single_run(&mut p.runs, &default_style);
+                let run = &mut p.runs[0];
+                let offset = tab.cursor.primary.offset.min(run.text.chars().count());
+                if offset > 0 {
+                    if remove_char_at(&mut run.text, offset - 1) {
+                        tab.cursor.primary.offset = offset - 1;
+                        changed = true;
+                    }
+                } else if current_pos > 0 {
+                    tab.cursor.primary.block_id = blocks[current_pos - 1].0;
+                    tab.cursor.primary.offset = blocks[current_pos - 1].1;
+                    return true;
+                }
+            }
+            Block::Heading(h) => {
+                ensure_single_run(&mut h.runs, &default_style);
+                let run = &mut h.runs[0];
+                let offset = tab.cursor.primary.offset.min(run.text.chars().count());
+                if offset > 0 {
+                    if remove_char_at(&mut run.text, offset - 1) {
+                        tab.cursor.primary.offset = offset - 1;
+                        changed = true;
+                    }
+                } else if current_pos > 0 {
+                    tab.cursor.primary.block_id = blocks[current_pos - 1].0;
+                    tab.cursor.primary.offset = blocks[current_pos - 1].1;
+                    return true;
+                }
+            }
+            Block::CodeBlock(c) => {
+                let offset = tab.cursor.primary.offset.min(c.code.chars().count());
+                if offset > 0 {
+                    if remove_char_at(&mut c.code, offset - 1) {
+                        tab.cursor.primary.offset = offset - 1;
+                        changed = true;
+                    }
+                } else if current_pos > 0 {
+                    tab.cursor.primary.block_id = blocks[current_pos - 1].0;
+                    tab.cursor.primary.offset = blocks[current_pos - 1].1;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        if changed {
+            tab.document.dirty = true;
+            tab.dirty = true;
+        }
+        return changed;
+    }
+    false
+}
+
+fn delete_forward_at_cursor(state: &mut WindowState) -> bool {
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let idx = ensure_editable_cursor_block(tab, &default_style);
+        let blocks = collect_text_block_lengths(&tab.document);
+        let current_pos = blocks
+            .iter()
+            .position(|(id, _)| *id == tab.cursor.primary.block_id)
+            .unwrap_or(0);
+
+        let mut changed = false;
+        match &mut tab.document.content[idx] {
+            Block::Paragraph(p) => {
+                ensure_single_run(&mut p.runs, &default_style);
+                let run = &mut p.runs[0];
+                let offset = tab.cursor.primary.offset.min(run.text.chars().count());
+                if offset < run.text.chars().count() {
+                    changed = remove_char_at(&mut run.text, offset);
+                } else if current_pos + 1 < blocks.len() {
+                    tab.cursor.primary.block_id = blocks[current_pos + 1].0;
+                    tab.cursor.primary.offset = 0;
+                    return true;
+                }
+            }
+            Block::Heading(h) => {
+                ensure_single_run(&mut h.runs, &default_style);
+                let run = &mut h.runs[0];
+                let offset = tab.cursor.primary.offset.min(run.text.chars().count());
+                if offset < run.text.chars().count() {
+                    changed = remove_char_at(&mut run.text, offset);
+                } else if current_pos + 1 < blocks.len() {
+                    tab.cursor.primary.block_id = blocks[current_pos + 1].0;
+                    tab.cursor.primary.offset = 0;
+                    return true;
+                }
+            }
+            Block::CodeBlock(c) => {
+                let offset = tab.cursor.primary.offset.min(c.code.chars().count());
+                if offset < c.code.chars().count() {
+                    changed = remove_char_at(&mut c.code, offset);
+                } else if current_pos + 1 < blocks.len() {
+                    tab.cursor.primary.block_id = blocks[current_pos + 1].0;
+                    tab.cursor.primary.offset = 0;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        if changed {
+            tab.document.dirty = true;
+            tab.dirty = true;
+        }
+        return changed;
+    }
+    false
+}
+
+fn split_block_or_insert_newline(state: &mut WindowState) -> bool {
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let idx = ensure_editable_cursor_block(tab, &default_style);
+        let new_id = tab.document.next_block_id();
+        let mut insert_block: Option<Block> = None;
+
+        match &mut tab.document.content[idx] {
+            Block::Paragraph(p) => {
+                ensure_single_run(&mut p.runs, &default_style);
+                let run = &mut p.runs[0];
+                let offset = tab.cursor.primary.offset.min(run.text.chars().count());
+                let at = byte_index_from_char_offset(run.text.as_str(), offset);
+                let right = run.text.split_off(at);
+                insert_block = Some(default_paragraph_with_style(new_id, &run.style, right));
+            }
+            Block::Heading(h) => {
+                ensure_single_run(&mut h.runs, &default_style);
+                let run = &mut h.runs[0];
+                let offset = tab.cursor.primary.offset.min(run.text.chars().count());
+                let at = byte_index_from_char_offset(run.text.as_str(), offset);
+                let right = run.text.split_off(at);
+                insert_block = Some(default_paragraph_with_style(new_id, &run.style, right));
+            }
+            Block::CodeBlock(c) => {
+                let offset = tab.cursor.primary.offset.min(c.code.chars().count());
+                let at = byte_index_from_char_offset(c.code.as_str(), offset);
+                c.code.insert(at, '\n');
+                tab.cursor.primary.offset = offset + 1;
+                tab.document.dirty = true;
+                tab.dirty = true;
+                return true;
+            }
+            _ => {}
+        }
+
+        if let Some(block) = insert_block {
+            let insert_at = (idx + 1).min(tab.document.content.len());
+            tab.document.content.insert(insert_at, block);
+            tab.cursor.primary.block_id = new_id;
+            tab.cursor.primary.offset = 0;
+            tab.document.dirty = true;
+            tab.dirty = true;
+            return true;
+        }
+    }
+    false
+}
+
+fn move_cursor_in_text_blocks(state: &mut WindowState, movement: Movement) -> bool {
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let _ = ensure_editable_cursor_block(tab, &default_style);
+        let blocks = collect_text_block_lengths(&tab.document);
+        if blocks.is_empty() {
+            return false;
+        }
+        let before = tab.cursor.primary;
+        tab.cursor
+            .move_across_blocks(movement, blocks.as_slice(), 1, false);
+        return tab.cursor.primary != before;
+    }
+    false
+}
+
+fn cycle_font_family(state: &mut WindowState) -> bool {
+    let families = ["Segoe UI", "Calibri", "Cambria", "Consolas"];
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let idx = ensure_editable_cursor_block(tab, &default_style);
+        let mut changed = false;
+        match &mut tab.document.content[idx] {
+            Block::Paragraph(p) => {
+                ensure_single_run(&mut p.runs, &default_style);
+                let current = p.runs[0]
+                    .style
+                    .font_family
+                    .clone()
+                    .unwrap_or_else(|| families[0].to_string());
+                let pos = families
+                    .iter()
+                    .position(|v| v.eq_ignore_ascii_case(current.as_str()))
+                    .unwrap_or(0);
+                p.runs[0].style.font_family = Some(families[(pos + 1) % families.len()].to_string());
+                changed = true;
+            }
+            Block::Heading(h) => {
+                ensure_single_run(&mut h.runs, &default_style);
+                let current = h.runs[0]
+                    .style
+                    .font_family
+                    .clone()
+                    .unwrap_or_else(|| families[0].to_string());
+                let pos = families
+                    .iter()
+                    .position(|v| v.eq_ignore_ascii_case(current.as_str()))
+                    .unwrap_or(0);
+                h.runs[0].style.font_family = Some(families[(pos + 1) % families.len()].to_string());
+                changed = true;
+            }
+            _ => {}
+        }
+        if changed {
+            tab.document.dirty = true;
+            tab.dirty = true;
+        }
+        return changed;
+    }
+    false
+}
+
+fn cycle_font_size(state: &mut WindowState) -> bool {
+    let sizes = [10.0_f32, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0];
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let idx = ensure_editable_cursor_block(tab, &default_style);
+        let mut changed = false;
+        match &mut tab.document.content[idx] {
+            Block::Paragraph(p) => {
+                ensure_single_run(&mut p.runs, &default_style);
+                let current = p.runs[0].style.font_size.unwrap_or(12.0);
+                let next = sizes
+                    .iter()
+                    .copied()
+                    .find(|size| *size > current + f32::EPSILON)
+                    .unwrap_or(sizes[0]);
+                p.runs[0].style.font_size = Some(next);
+                changed = true;
+            }
+            Block::Heading(h) => {
+                ensure_single_run(&mut h.runs, &default_style);
+                let current = h.runs[0].style.font_size.unwrap_or(12.0);
+                let next = sizes
+                    .iter()
+                    .copied()
+                    .find(|size| *size > current + f32::EPSILON)
+                    .unwrap_or(sizes[0]);
+                h.runs[0].style.font_size = Some(next);
+                changed = true;
+            }
+            _ => {}
+        }
+        if changed {
+            tab.document.dirty = true;
+            tab.dirty = true;
+        }
+        return changed;
+    }
+    false
+}
+
+fn cycle_text_color(state: &mut WindowState) -> bool {
+    let colors = [
+        None,
+        Some(crate::ui::Color::rgb(0.0, 0.0, 0.0)),
+        Some(crate::ui::Color::rgb(0.75, 0.12, 0.12)),
+        Some(crate::ui::Color::rgb(0.12, 0.32, 0.78)),
+        Some(crate::ui::Color::rgb(0.08, 0.55, 0.24)),
+    ];
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let idx = ensure_editable_cursor_block(tab, &default_style);
+        let mut changed = false;
+        match &mut tab.document.content[idx] {
+            Block::Paragraph(p) => {
+                ensure_single_run(&mut p.runs, &default_style);
+                let current = p.runs[0].style.color;
+                let pos = colors.iter().position(|c| *c == current).unwrap_or(0);
+                p.runs[0].style.color = colors[(pos + 1) % colors.len()];
+                changed = true;
+            }
+            Block::Heading(h) => {
+                ensure_single_run(&mut h.runs, &default_style);
+                let current = h.runs[0].style.color;
+                let pos = colors.iter().position(|c| *c == current).unwrap_or(0);
+                h.runs[0].style.color = colors[(pos + 1) % colors.len()];
+                changed = true;
+            }
+            _ => {}
+        }
+        if changed {
+            tab.document.dirty = true;
+            tab.dirty = true;
+        }
+        return changed;
+    }
+    false
+}
+
+fn cycle_heading_style(state: &mut WindowState) -> bool {
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let idx = ensure_editable_cursor_block(tab, &default_style);
+        if let Block::Paragraph(p) = &mut tab.document.content[idx] {
+            let next = match p.style_id.as_deref() {
+                Some("Heading1") => Some("Heading2".to_string()),
+                Some("Heading2") => Some("Heading3".to_string()),
+                Some("Heading3") => None,
+                _ => Some("Heading1".to_string()),
+            };
+            p.style_id = next;
+            tab.document.dirty = true;
+            tab.dirty = true;
+            return true;
+        }
+    }
+    false
+}
+
+fn cycle_list_style(state: &mut WindowState) -> bool {
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let idx = ensure_editable_cursor_block(tab, &default_style);
+        if let Block::Paragraph(p) = &mut tab.document.content[idx] {
+            let next = match p.style_id.as_deref() {
+                Some("ListBullet") => Some("ListNumber".to_string()),
+                Some("ListNumber") => Some("ListCheckbox".to_string()),
+                Some("ListCheckbox") => None,
+                _ => Some("ListBullet".to_string()),
+            };
+            p.style_id = next;
+            tab.document.dirty = true;
+            tab.dirty = true;
+            return true;
+        }
+    }
+    false
+}
+
+fn set_paragraph_alignment(state: &mut WindowState, alignment: ParagraphAlignment) -> bool {
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let idx = ensure_editable_cursor_block(tab, &default_style);
+        if let Block::Paragraph(p) = &mut tab.document.content[idx] {
+            p.alignment = alignment;
+            tab.document.dirty = true;
+            tab.dirty = true;
+            return true;
+        }
+    }
+    false
+}
+
+fn toggle_inline_style(state: &mut WindowState, action: ToolbarAction) -> bool {
+    let default_style = run_style_from_toolbar(&state.toolbar.format_state);
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let idx = ensure_editable_cursor_block(tab, &default_style);
+        let mut changed = false;
+
+        let apply = |style: &mut RunStyle| match action {
+            ToolbarAction::Bold => {
+                style.bold = !style.bold;
+                true
+            }
+            ToolbarAction::Italic => {
+                style.italic = !style.italic;
+                true
+            }
+            ToolbarAction::Underline => {
+                style.underline = !style.underline;
+                true
+            }
+            ToolbarAction::Strikethrough => {
+                style.strikethrough = !style.strikethrough;
+                true
+            }
+            _ => false,
+        };
+
+        match &mut tab.document.content[idx] {
+            Block::Paragraph(p) => {
+                ensure_single_run(&mut p.runs, &default_style);
+                changed = apply(&mut p.runs[0].style);
+            }
+            Block::Heading(h) => {
+                ensure_single_run(&mut h.runs, &default_style);
+                changed = apply(&mut h.runs[0].style);
+            }
+            _ => {}
+        }
+
+        if changed {
+            tab.document.dirty = true;
+            tab.dirty = true;
+        }
+        return changed;
+    }
+    false
+}
+
+fn heading_state_for_block(block: &Block) -> HeadingState {
+    match block {
+        Block::Heading(h) => match h.level {
+            1 => HeadingState::H1,
+            2 => HeadingState::H2,
+            3 => HeadingState::H3,
+            4 => HeadingState::H4,
+            5 => HeadingState::H5,
+            6 => HeadingState::H6,
+            _ => HeadingState::Normal,
+        },
+        Block::Paragraph(p) => match p.style_id.as_deref() {
+            Some("Heading1") => HeadingState::H1,
+            Some("Heading2") => HeadingState::H2,
+            Some("Heading3") => HeadingState::H3,
+            Some("Heading4") => HeadingState::H4,
+            Some("Heading5") => HeadingState::H5,
+            Some("Heading6") => HeadingState::H6,
+            _ => HeadingState::Normal,
+        },
+        _ => HeadingState::Normal,
+    }
+}
+
+fn list_state_for_block(block: &Block) -> ListState {
+    match block {
+        Block::Paragraph(p) => match p.style_id.as_deref() {
+            Some("ListBullet") => ListState::Bulleted,
+            Some("ListNumber") => ListState::Numbered,
+            Some("ListCheckbox") => ListState::Checkbox,
+            _ => ListState::None,
+        },
+        _ => ListState::None,
+    }
+}
+
+fn alignment_state_for_block(block: &Block) -> AlignmentState {
+    match block {
+        Block::Paragraph(p) => match p.alignment {
+            ParagraphAlignment::Left => AlignmentState::Left,
+            ParagraphAlignment::Center => AlignmentState::Center,
+            ParagraphAlignment::Right => AlignmentState::Right,
+            ParagraphAlignment::Justify => AlignmentState::Justify,
+        },
+        _ => AlignmentState::Left,
+    }
+}
+
+fn sync_toolbar_format_from_cursor(state: &mut WindowState) {
+    let mut format = ToolbarFormatState {
+        font_family: "Segoe UI".to_string(),
+        font_size: 12.0,
+        ..ToolbarFormatState::default()
+    };
+
+    if let Some(tab) = state.tabs.active_tab() {
+        if let Some(idx) = find_block_index_by_id(&tab.document, tab.cursor.primary.block_id) {
+            let block = &tab.document.content[idx];
+            let first_style = match block {
+                Block::Paragraph(p) => p.runs.first().map(|r| r.style.clone()),
+                Block::Heading(h) => h.runs.first().map(|r| r.style.clone()),
+                _ => None,
+            };
+
+            if let Some(style) = first_style {
+                format.bold = if style.bold {
+                    ToggleState::On
+                } else {
+                    ToggleState::Off
+                };
+                format.italic = if style.italic {
+                    ToggleState::On
+                } else {
+                    ToggleState::Off
+                };
+                format.underline = if style.underline {
+                    ToggleState::On
+                } else {
+                    ToggleState::Off
+                };
+                format.strikethrough = if style.strikethrough {
+                    ToggleState::On
+                } else {
+                    ToggleState::Off
+                };
+                format.superscript = if style.superscript {
+                    ToggleState::On
+                } else {
+                    ToggleState::Off
+                };
+                format.subscript = if style.subscript {
+                    ToggleState::On
+                } else {
+                    ToggleState::Off
+                };
+                format.font_family = style
+                    .font_family
+                    .clone()
+                    .unwrap_or_else(|| "Segoe UI".to_string());
+                format.font_size = style.font_size.unwrap_or(12.0);
+                format.text_color = style.color;
+                format.highlight_color = style.background;
+            }
+
+            format.alignment = alignment_state_for_block(block);
+            format.heading = heading_state_for_block(block);
+            format.list = list_state_for_block(block);
+        }
+    }
+
+    state.toolbar.set_format_state(format);
+}
+
+fn apply_toolbar_action(state: &mut WindowState, hwnd: HWND, action: ToolbarAction) -> bool {
+    match action {
+        ToolbarAction::CommandPalette => {
+            state.command_palette.open();
+            state
+                .command_palette
+                .refresh_results(Some(&state.app_state));
+            state.app_state.status_text = "Command palette".to_string();
+            true
+        }
+        ToolbarAction::FileMenu => {
+            let _ = open_file_via_picker(state, hwnd, false);
+            true
+        }
+        ToolbarAction::Cut => {
+            let ok = cut_active_block_to_clipboard(state);
+            state.app_state.status_text = if ok {
+                "Cut".to_string()
+            } else {
+                "Cut failed".to_string()
+            };
+            ok
+        }
+        ToolbarAction::Copy => {
+            let ok = copy_active_block_to_clipboard(state);
+            state.app_state.status_text = if ok {
+                "Copied".to_string()
+            } else {
+                "Copy failed".to_string()
+            };
+            ok
+        }
+        ToolbarAction::Paste => {
+            if paste_text_from_clipboard_at_cursor(state) {
+                state.app_state.status_text = "Pasted text".to_string();
+                true
+            } else if let Ok(id) = insert_image_from_clipboard(state) {
+                state.app_state.status_text = format!("Pasted image {}", id.0);
+                true
+            } else {
+                state.app_state.status_text = "Paste".to_string();
+                true
+            }
+        }
+        ToolbarAction::Bold
+        | ToolbarAction::Italic
+        | ToolbarAction::Underline
+        | ToolbarAction::Strikethrough => {
+            let ok = toggle_inline_style(state, action);
+            state.app_state.status_text = if ok {
+                format!("{} toggled", toolbar_action_text(action))
+            } else {
+                format!("{} unavailable", toolbar_action_text(action))
+            };
+            ok
+        }
+        ToolbarAction::FontFamily => {
+            let ok = cycle_font_family(state);
+            state.app_state.status_text = if ok {
+                "Font family changed".to_string()
+            } else {
+                "Font family".to_string()
+            };
+            ok
+        }
+        ToolbarAction::FontSize => {
+            let ok = cycle_font_size(state);
+            state.app_state.status_text = if ok {
+                "Font size changed".to_string()
+            } else {
+                "Font size".to_string()
+            };
+            ok
+        }
+        ToolbarAction::TextColor => {
+            let ok = cycle_text_color(state);
+            state.app_state.status_text = if ok {
+                "Text color changed".to_string()
+            } else {
+                "Text color".to_string()
+            };
+            ok
+        }
+        ToolbarAction::AlignLeft => {
+            if align_selected_image(state, ImageAlignment::Left) {
+                state.app_state.status_text = "Image aligned left".to_string();
+                true
+            } else if set_paragraph_alignment(state, ParagraphAlignment::Left) {
+                state.app_state.status_text = "Align left".to_string();
+                true
+            } else {
+                false
+            }
+        }
+        ToolbarAction::AlignCenter => {
+            if align_selected_image(state, ImageAlignment::Center) {
+                state.app_state.status_text = "Image aligned center".to_string();
+                true
+            } else if set_paragraph_alignment(state, ParagraphAlignment::Center) {
+                state.app_state.status_text = "Align center".to_string();
+                true
+            } else {
+                false
+            }
+        }
+        ToolbarAction::AlignRight => {
+            if align_selected_image(state, ImageAlignment::Right) {
+                state.app_state.status_text = "Image aligned right".to_string();
+                true
+            } else if set_paragraph_alignment(state, ParagraphAlignment::Right) {
+                state.app_state.status_text = "Align right".to_string();
+                true
+            } else {
+                false
+            }
+        }
+        ToolbarAction::AlignJustify => {
+            let ok = set_paragraph_alignment(state, ParagraphAlignment::Justify);
+            state.app_state.status_text = if ok {
+                "Align justify".to_string()
+            } else {
+                "Align justify unavailable".to_string()
+            };
+            ok
+        }
+        ToolbarAction::Heading => {
+            let ok = cycle_heading_style(state);
+            state.app_state.status_text = if ok {
+                "Heading style changed".to_string()
+            } else {
+                "Heading".to_string()
+            };
+            ok
+        }
+        ToolbarAction::List => {
+            let ok = cycle_list_style(state);
+            state.app_state.status_text = if ok {
+                "List style changed".to_string()
+            } else {
+                "List".to_string()
+            };
+            ok
+        }
+        ToolbarAction::InsertImage => {
+            if let Some(path) = pick_image_file(hwnd) {
+                match insert_image_from_path(state, &path) {
+                    Ok(id) => {
+                        state.app_state.status_text = format!(
+                            "Inserted image {} ({})",
+                            id.0,
+                            path.file_name()
+                                .and_then(|v| v.to_str())
+                                .unwrap_or("image")
+                        );
+                        true
+                    }
+                    Err(err) => {
+                        state.app_state.status_text = format!("Insert image failed: {err}");
+                        false
+                    }
+                }
+            } else {
+                state.app_state.status_text = "Insert image cancelled".to_string();
+                false
+            }
+        }
+        ToolbarAction::InsertLink => {
+            let ok = insert_text_at_cursor(state, "https://");
+            state.app_state.status_text = if ok {
+                "Link inserted".to_string()
+            } else {
+                "Insert link".to_string()
+            };
+            ok
+        }
+        ToolbarAction::InsertTable => {
+            open_table_picker(state);
+            state.app_state.status_text = "Insert table (picker)".to_string();
+            true
+        }
+        ToolbarAction::Undo => {
+            state.app_state.status_text = "Undo is not available yet".to_string();
+            true
+        }
+        ToolbarAction::Redo => {
+            state.app_state.status_text = "Redo is not available yet".to_string();
+            true
+        }
+        ToolbarAction::More => {
+            state.command_palette.open();
+            state
+                .command_palette
+                .refresh_results(Some(&state.app_state));
+            state.app_state.status_text = "More actions".to_string();
+            true
+        }
+    }
+}
+
+fn apply_toolbar_intent(state: &mut WindowState, hwnd: HWND, intent: ToolbarIntent) -> bool {
+    match intent {
+        ToolbarIntent::Action(action) => {
+            let handled = apply_toolbar_action(state, hwnd, action);
+            sync_toolbar_format_from_cursor(state);
+            handled
+        }
+        ToolbarIntent::OpenDropdown(kind) => {
+            state.app_state.status_text = format!("{kind:?} menu");
+            true
+        }
+    }
+}
+
 fn collect_navigable_block_ids(doc: &DocumentModel, out: &mut Vec<BlockId>) {
     fn walk(block: &Block, out: &mut Vec<BlockId>) {
         match block {
@@ -2652,6 +3695,8 @@ fn welcome_preview_lines(state: &WindowState) -> Vec<String> {
 }
 
 fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
+    sync_toolbar_format_from_cursor(state);
+
     let mut word_count = 0usize;
     let mut character_count = 0usize;
     let mut page_index = 1usize;
@@ -2917,12 +3962,23 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         tab_transition_offset: state.tabs.transition_slide_offset(),
         tab_has_overflow_left: state.tabs.overflow_offset > 0,
         tab_has_overflow_right: state.tabs.overflow_offset + state.tabs.tab_rects.len() < state.tabs.tabs.len(),
-        toolbar_labels: state
+        toolbar_buttons: state
             .toolbar
             .buttons
             .iter()
-            .filter(|b| !b.label.is_empty())
-            .map(|b| b.label.to_string())
+            .enumerate()
+            .filter_map(|(idx, button)| {
+                state
+                    .toolbar
+                    .button_rect(idx)
+                    .map(|rect| crate::render::d2d::ToolbarShellButton {
+                        rect,
+                        label: button.label.clone(),
+                        icon: button.icon_glyph.to_string(),
+                        active: button.active || button.indeterminate,
+                        enabled: button.enabled,
+                    })
+            })
             .collect(),
         toolbar_dropdown_open: state.toolbar.dropdown.open.is_some(),
         toolbar_dropdown_opacity: state.toolbar.dropdown.opacity,
@@ -3407,7 +4463,31 @@ unsafe extern "system" fn window_proc(
                     let mut handled = state.command_palette.handle_input(&event);
                     if vk == 0x0D {
                         handled |= state.command_palette.execute_selected(&mut state.app_state);
-                        if handled && state.app_state.status_text == "Find" {
+                        if handled && state.app_state.status_text == "New document" {
+                            let index = open_new_blank_tab(state);
+                            let title = state
+                                .tabs
+                                .tabs
+                                .get(index)
+                                .map(|tab| tab.title.clone())
+                                .unwrap_or_else(|| "New tab".to_string());
+                            state.app_state.status_text = format!("Opened {title}");
+                            sync_sidebar_with_active_tab(state);
+                        } else if handled && state.app_state.status_text == "Open file" {
+                            let _ = open_file_via_picker(state, hwnd, true);
+                        } else if handled && state.app_state.status_text == "Cut" {
+                            if cut_active_block_to_clipboard(state) {
+                                state.app_state.status_text = "Cut".to_string();
+                            }
+                        } else if handled && state.app_state.status_text == "Copy" {
+                            if copy_active_block_to_clipboard(state) {
+                                state.app_state.status_text = "Copied".to_string();
+                            }
+                        } else if handled && state.app_state.status_text == "Paste" {
+                            if paste_text_from_clipboard_at_cursor(state) {
+                                state.app_state.status_text = "Pasted".to_string();
+                            }
+                        } else if handled && state.app_state.status_text == "Find" {
                             state.find_replace.open_find();
                             state.find_focus = FindFieldFocus::Query;
                             refresh_find_results(state);
@@ -3575,6 +4655,12 @@ unsafe extern "system" fn window_proc(
                     return LRESULT(0);
                 }
 
+                if ctrl_down && !shift_down && vk == 0x4F {
+                    let _ = open_file_via_picker(state, hwnd, true);
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+
                 if !state.command_palette.is_open()
                     && !state.find_replace.find_visible
                     && !state.goto_visible
@@ -3582,6 +4668,36 @@ unsafe extern "system" fn window_proc(
                 {
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
+                }
+
+                if ctrl_down
+                    && !shift_down
+                    && vk == 0x43
+                    && !state.find_replace.find_visible
+                    && !state.command_palette.is_open()
+                    && !state.goto_visible
+                {
+                    if copy_active_block_to_clipboard(state) {
+                        state.app_state.status_text = "Copied".to_string();
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+                }
+
+                if ctrl_down
+                    && !shift_down
+                    && vk == 0x58
+                    && !state.find_replace.find_visible
+                    && !state.command_palette.is_open()
+                    && !state.goto_visible
+                {
+                    if cut_active_block_to_clipboard(state) {
+                        state.app_state.status_text = "Cut".to_string();
+                        sync_sidebar_with_active_tab(state);
+                        sync_toolbar_format_from_cursor(state);
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
                 }
 
                 if ctrl_down
@@ -3594,10 +4710,19 @@ unsafe extern "system" fn window_proc(
                     match insert_image_from_clipboard(state) {
                         Ok(id) => {
                             state.app_state.status_text = format!("Pasted image {}", id.0);
+                            sync_toolbar_format_from_cursor(state);
                             let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                             return LRESULT(0);
                         }
-                        Err(_) => {}
+                        Err(_) => {
+                            if paste_text_from_clipboard_at_cursor(state) {
+                                state.app_state.status_text = "Pasted".to_string();
+                                sync_sidebar_with_active_tab(state);
+                                sync_toolbar_format_from_cursor(state);
+                                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                                return LRESULT(0);
+                            }
+                        }
                     }
                 }
 
@@ -4012,6 +5137,36 @@ unsafe extern "system" fn window_proc(
                     return LRESULT(0);
                 }
 
+                if !ctrl_down
+                    && !state.find_replace.find_visible
+                    && !state.command_palette.is_open()
+                    && !state.goto_visible
+                    && !state.table_picker_visible
+                {
+                    let handled_text = match vk {
+                        0x08 => delete_backward_at_cursor(state),
+                        0x0D => split_block_or_insert_newline(state),
+                        0x2E => delete_forward_at_cursor(state),
+                        0x09 => insert_text_at_cursor(state, "\t"),
+                        0x25 => move_cursor_in_text_blocks(state, Movement::Left),
+                        0x27 => move_cursor_in_text_blocks(state, Movement::Right),
+                        0x26 => move_cursor_in_text_blocks(state, Movement::Up),
+                        0x28 => move_cursor_in_text_blocks(state, Movement::Down),
+                        0x24 => move_cursor_in_text_blocks(state, Movement::Home),
+                        0x23 => move_cursor_in_text_blocks(state, Movement::End),
+                        0x21 => move_cursor_in_text_blocks(state, Movement::PageUp),
+                        0x22 => move_cursor_in_text_blocks(state, Movement::PageDown),
+                        _ => false,
+                    };
+
+                    if handled_text {
+                        sync_sidebar_with_active_tab(state);
+                        sync_toolbar_format_from_cursor(state);
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+                }
+
                 if !ctrl_down && state.app_state.show_sidebar {
                     let event = UiInputEvent::KeyDown(vk);
                     if state.sidebar.handle_input(&event) || apply_pending_sidebar_intents(state) {
@@ -4102,6 +5257,26 @@ unsafe extern "system" fn window_proc(
                                 return LRESULT(0);
                             }
                         }
+                    }
+                }
+
+                let ctrl_down = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+                if !ctrl_down
+                    && !state.command_palette.is_open()
+                    && !state.find_replace.find_visible
+                    && !state.goto_visible
+                    && !state.table_picker_visible
+                    && !state.settings_dialog.is_open()
+                    && let Some(ch) = char::from_u32(code)
+                    && !ch.is_control()
+                {
+                    let mut buf = [0u8; 4];
+                    let text = ch.encode_utf8(&mut buf);
+                    if insert_text_at_cursor(state, text) {
+                        sync_sidebar_with_active_tab(state);
+                        sync_toolbar_format_from_cursor(state);
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
                     }
                 }
             }
@@ -4283,81 +5458,6 @@ unsafe extern "system" fn window_proc(
                 }
 
                 if state.app_state.show_toolbar {
-                    if let Some(index) = state.toolbar.hit_button(point) {
-                        if let Some(action) = state.toolbar.invoke(index) {
-                            match action {
-                                ToolbarAction::CommandPalette => {
-                                    state.command_palette.open();
-                                    state
-                                        .command_palette
-                                        .refresh_results(Some(&state.app_state));
-                                    state.app_state.status_text = "Command palette".to_string();
-                                }
-                                ToolbarAction::InsertImage => {
-                                    if let Some(path) = pick_image_file(hwnd) {
-                                        match insert_image_from_path(state, &path) {
-                                            Ok(id) => {
-                                                state.app_state.status_text = format!(
-                                                    "Inserted image {} ({})",
-                                                    id.0,
-                                                    path.file_name()
-                                                        .and_then(|v| v.to_str())
-                                                        .unwrap_or("image")
-                                                );
-                                            }
-                                            Err(err) => {
-                                                state.app_state.status_text =
-                                                    format!("Insert image failed: {err}");
-                                            }
-                                        }
-                                    } else {
-                                        state.app_state.status_text =
-                                            "Insert image cancelled".to_string();
-                                    }
-                                }
-                                ToolbarAction::InsertTable => {
-                                    open_table_picker(state);
-                                    state.app_state.status_text = "Insert table (picker)".to_string();
-                                }
-                                ToolbarAction::Paste => {
-                                    if let Ok(id) = insert_image_from_clipboard(state) {
-                                        state.app_state.status_text =
-                                            format!("Pasted image {}", id.0);
-                                    } else {
-                                        state.app_state.status_text = "Paste".to_string();
-                                    }
-                                }
-                                ToolbarAction::AlignLeft => {
-                                    if align_selected_image(state, ImageAlignment::Left) {
-                                        state.app_state.status_text =
-                                            "Image aligned left".to_string();
-                                    } else {
-                                        state.app_state.status_text = "Align left".to_string();
-                                    }
-                                }
-                                ToolbarAction::AlignCenter => {
-                                    if align_selected_image(state, ImageAlignment::Center) {
-                                        state.app_state.status_text =
-                                            "Image aligned center".to_string();
-                                    } else {
-                                        state.app_state.status_text = "Align center".to_string();
-                                    }
-                                }
-                                ToolbarAction::AlignRight => {
-                                    if align_selected_image(state, ImageAlignment::Right) {
-                                        state.app_state.status_text =
-                                            "Image aligned right".to_string();
-                                    } else {
-                                        state.app_state.status_text = "Align right".to_string();
-                                    }
-                                }
-                                _ => {
-                                    state.app_state.status_text =
-                                        format!("Toolbar action: {}", toolbar_action_text(action));
-                                }
-                            }
-                        }
-                    }
                     handled |= state.toolbar.handle_input(&event);
                 }
 
@@ -4422,11 +5522,11 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONUP => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
                 let point = point_from_lparam(lparam);
+                let mut handled = false;
                 if state.app_state.show_tabs {
                     let tab_event = UiInputEvent::MouseUp(point);
                     if state.tabs.handle_input(&tab_event) {
-                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
-                        return LRESULT(0);
+                        handled = true;
                     }
                 }
                 if state.sidebar_resizing {
@@ -4437,16 +5537,25 @@ unsafe extern "system" fn window_proc(
                         "Sidebar width set to {:.0}px",
                         state.app_state.sidebar_width
                     );
-                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
-                    return LRESULT(0);
+                    handled = true;
                 }
                 if state.table_resize.take().is_some() {
                     let _ = unsafe { ReleaseCapture() };
                     state.app_state.status_text = "Table resized".to_string();
-                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
-                    return LRESULT(0);
+                    handled = true;
                 }
                 if state.image_drag.take().is_some() {
+                    handled = true;
+                }
+                if state.app_state.show_toolbar {
+                    let toolbar_event = UiInputEvent::MouseUp(point);
+                    handled |= state.toolbar.handle_input(&toolbar_event);
+                    if let Some(intent) = state.toolbar.pending_intent.take() {
+                        handled |= apply_toolbar_intent(state, hwnd, intent);
+                    }
+                }
+
+                if handled {
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
                 }
