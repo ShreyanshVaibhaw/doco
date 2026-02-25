@@ -43,6 +43,7 @@ use crate::{
     document::{
         DocumentFormat, detect_format,
         docx::parser::parse_docx,
+        export::{export_pdf, save_with_format},
         markdown::MarkdownDocument,
         model::{
             Block, BlockId, DocumentModel, ImageAlignment, ImageBorder, ImageBorderStyle,
@@ -93,7 +94,7 @@ use crate::{
     },
     window::integration::{
         DropAction, JumpListState, PrintState, extract_drop_payload, parse_startup_files_from_cli,
-        pick_image_file,
+        pick_image_file, pick_save_file,
     },
 };
 
@@ -430,6 +431,174 @@ fn load_document_for_path(path: &Path) -> DocumentModel {
         model.metadata.format = detected;
     }
     model
+}
+
+fn default_extension_for_document(state: &WindowState, format: DocumentFormat) -> String {
+    let from_settings = state
+        .app_state
+        .settings
+        .files
+        .default_save_format
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if !from_settings.is_empty() {
+        return from_settings;
+    }
+    match format {
+        DocumentFormat::Docx | DocumentFormat::Unknown => "docx".to_string(),
+        DocumentFormat::Pdf => "pdf".to_string(),
+        DocumentFormat::Text => "txt".to_string(),
+        DocumentFormat::Markdown => "md".to_string(),
+    }
+}
+
+fn suggested_save_name(tab: &crate::ui::tabs::TabState, default_ext: &str) -> String {
+    if let Some(path) = tab
+        .file_path
+        .as_ref()
+        .or(tab.document.metadata.file_path.as_ref())
+        && let Some(name) = path.file_name().and_then(|v| v.to_str())
+    {
+        return name.to_string();
+    }
+    let base = if !tab.document.metadata.title.trim().is_empty() {
+        tab.document.metadata.title.trim().to_string()
+    } else {
+        "Untitled".to_string()
+    };
+    format!("{base}.{default_ext}")
+}
+
+fn pick_save_target_for_active_tab(
+    state: &WindowState,
+    hwnd: HWND,
+    forced_ext: Option<&str>,
+) -> Option<PathBuf> {
+    let tab = state.tabs.active_tab()?;
+    let default_ext = forced_ext
+        .map(|v| v.trim_start_matches('.').to_ascii_lowercase())
+        .unwrap_or_else(|| default_extension_for_document(state, tab.document.metadata.format));
+    let suggested = suggested_save_name(tab, default_ext.as_str());
+    pick_save_file(hwnd, suggested.as_str(), default_ext.as_str())
+}
+
+fn path_is_read_only(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.permissions().readonly())
+        .unwrap_or(false)
+}
+
+fn save_active_document(state: &mut WindowState, hwnd: HWND, save_as: bool) -> bool {
+    let (existing_path, document) = {
+        let Some(tab) = state.tabs.active_tab() else {
+            state.app_state.status_text = "No active tab to save".to_string();
+            return true;
+        };
+        (
+            tab.file_path
+                .clone()
+                .or_else(|| tab.document.metadata.file_path.clone()),
+            tab.document.clone(),
+        )
+    };
+
+    let target = if !save_as {
+        existing_path.or_else(|| pick_save_target_for_active_tab(state, hwnd, None))
+    } else {
+        pick_save_target_for_active_tab(state, hwnd, None)
+    };
+
+    let Some(target) = target else {
+        state.app_state.status_text = "Save cancelled".to_string();
+        return true;
+    };
+
+    if target.exists() && path_is_read_only(target.as_path()) {
+        state.app_state.status_text = format!("Save blocked (read-only): {}", target.display());
+        return true;
+    }
+
+    match save_with_format(target.as_path(), &document) {
+        Ok(_) => {
+            if let Some(tab) = state.tabs.active_tab_mut() {
+                tab.file_path = Some(target.clone());
+                tab.title = document_title_from_path(target.as_path());
+                tab.document.metadata.file_path = Some(target.clone());
+                tab.document.metadata.format = detect_format(target.as_path());
+                tab.document.dirty = false;
+                tab.dirty = false;
+            }
+            state.jump_list.add_recent_file(target.clone());
+            let _ = state.app_state.autosave.clear_recovery_files();
+            state.app_state.status_text = format!("Saved {}", target.display());
+            sync_sidebar_with_active_tab(state);
+        }
+        Err(err) => {
+            state.app_state.status_text = format!("Save failed: {err}");
+        }
+    }
+    true
+}
+
+fn export_active_document(state: &mut WindowState, hwnd: HWND, ext: &str) -> bool {
+    let document = {
+        let Some(tab) = state.tabs.active_tab() else {
+            state.app_state.status_text = "No active tab to export".to_string();
+            return true;
+        };
+        tab.document.clone()
+    };
+
+    let Some(path) = pick_save_target_for_active_tab(state, hwnd, Some(ext)) else {
+        state.app_state.status_text = "Export cancelled".to_string();
+        return true;
+    };
+
+    let result = if ext.eq_ignore_ascii_case("pdf") {
+        export_pdf(path.as_path(), &document)
+    } else {
+        save_with_format(path.as_path(), &document)
+    };
+
+    match result {
+        Ok(_) => {
+            state.app_state.status_text = format!("Exported {}", path.display());
+        }
+        Err(err) => {
+            state.app_state.status_text = format!("Export failed: {err}");
+        }
+    }
+    true
+}
+
+fn restore_recovery_tabs(state: &mut WindowState) -> usize {
+    let recovery_files = state
+        .app_state
+        .autosave
+        .list_recovery_files()
+        .unwrap_or_default();
+    let mut restored = 0usize;
+    for recovery in recovery_files {
+        let bytes = match std::fs::read(&recovery) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let mut document = match serde_json::from_slice::<DocumentModel>(&bytes) {
+            Ok(model) => model,
+            Err(_) => continue,
+        };
+        document.metadata.file_path = None;
+        document.dirty = true;
+        let title = recovery
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .map(|v| format!("Recovered ({v})"))
+            .unwrap_or_else(|| "Recovered".to_string());
+        state.tabs.open_document_tab(title, None, document);
+        restored += 1;
+    }
+    restored
 }
 
 fn sync_sidebar_with_active_tab(state: &mut WindowState) {
@@ -925,7 +1094,7 @@ fn apply_table_shortcut(state: &mut WindowState, vk: u32, ctrl_down: bool, shift
                         }
                     }
                 }
-                0x53 => {
+                0x59 => {
                     if let Some(cell) = selected_cell {
                         changed = split_table_cell(table, cell);
                         if changed {
@@ -2418,6 +2587,7 @@ unsafe extern "system" fn window_proc(
                 }
                 relayout_shell(state, width as f32, height as f32);
 
+                let mut opened_any = false;
                 if !state.startup_files.is_empty() {
                     state.dropped_files = state.startup_files.clone();
                     state.app_state.status_text = format!(
@@ -2436,7 +2606,17 @@ unsafe extern "system" fn window_proc(
                             .tabs
                             .open_document_tab(title, Some(path.clone()), document);
                     }
-                } else {
+                    opened_any = true;
+                }
+
+                let recovered = restore_recovery_tabs(state);
+                if recovered > 0 {
+                    state.app_state.status_text =
+                        format!("Recovered {} unsaved document(s)", recovered);
+                    opened_any = true;
+                }
+
+                if !opened_any {
                     let _ = state.tabs.new_blank_tab();
                 }
 
@@ -2521,6 +2701,10 @@ unsafe extern "system" fn window_proc(
                 if let Some(tab) = state.tabs.active_tab_mut() {
                     needs_next_frame |= tab.canvas.update(dt);
                     tab.canvas.clamp_scroll(&tab.document);
+                    if let Ok(Some(path)) = state.app_state.autosave.tick(&tab.document) {
+                        state.app_state.status_text =
+                            format!("Auto-saved recovery snapshot: {}", path.display());
+                    }
                 }
                 if state.find_replace.should_live_update(now) {
                     let refreshed = refresh_find_results(state);
@@ -2656,6 +2840,15 @@ unsafe extern "system" fn window_proc(
                         } else if handled && state.app_state.status_text == "Insert table" {
                             open_table_picker(state);
                             state.app_state.status_text = "Insert table (picker)".to_string();
+                        } else if handled
+                            && (state.app_state.status_text == "Saved"
+                                || state.app_state.status_text == "Save")
+                        {
+                            let _ = save_active_document(state, hwnd, false);
+                        } else if handled && state.app_state.status_text == "Save As" {
+                            let _ = save_active_document(state, hwnd, true);
+                        } else if handled && state.app_state.status_text == "Export PDF" {
+                            let _ = export_active_document(state, hwnd, "pdf");
                         }
                     }
                     if handled {
@@ -2736,6 +2929,16 @@ unsafe extern "system" fn window_proc(
                         }
                         _ => {}
                     }
+                }
+
+                if ctrl_down && vk == 0x53 {
+                    if shift_down {
+                        let _ = save_active_document(state, hwnd, true);
+                    } else {
+                        let _ = save_active_document(state, hwnd, false);
+                    }
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
                 }
 
                 if !state.command_palette.is_open()

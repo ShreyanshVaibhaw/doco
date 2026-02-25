@@ -1207,7 +1207,7 @@ impl D2DRenderer {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
 
-                let shortcuts = "Tab/Shift+Tab Move  Shift+Arrows Expand  Ctrl+Shift+M Merge  Ctrl+Shift+S Split  Ctrl+Shift+1..5 Style  Ctrl+Shift+U/J/H/K Insert Row/Col";
+                let shortcuts = "Tab/Shift+Tab Move  Shift+Arrows Expand  Ctrl+Shift+M Merge  Ctrl+Shift+Y Split  Ctrl+Shift+1..5 Style  Ctrl+Shift+U/J/H/K Insert Row/Col";
                 let shortcuts_utf16 = shortcuts.encode_utf16().collect::<Vec<u16>>();
                 self.d2d_context.DrawText(
                     &shortcuts_utf16,

@@ -27,6 +27,10 @@ pub fn export_html(path: &Path, model: &DocumentModel) -> std::io::Result<()> {
     fs::write(path, to_html(model))
 }
 
+pub fn export_rtf(path: &Path, model: &DocumentModel) -> std::io::Result<()> {
+    fs::write(path, to_rtf(model))
+}
+
 pub fn export_pdf(path: &Path, model: &DocumentModel) -> std::io::Result<()> {
     // Minimal fallback PDF generator placeholder while the full render-to-PDF pipeline is wired.
     // The dependency stays available for richer output in the next iteration.
@@ -305,6 +309,104 @@ pub fn to_html(model: &DocumentModel) -> String {
     )
 }
 
+pub fn to_rtf(model: &DocumentModel) -> String {
+    fn escape_rtf(text: &str) -> String {
+        text.replace('\\', "\\\\")
+            .replace('{', "\\{")
+            .replace('}', "\\}")
+            .replace('\n', "\\line ")
+    }
+
+    let mut out = String::from("{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Segoe UI;}}\\viewkind4\\uc1\\pard");
+    for block in &model.content {
+        match block {
+            Block::Heading(h) => {
+                let text = h.runs.iter().map(|r| r.text.as_str()).collect::<String>();
+                out.push_str("\\b ");
+                out.push_str(escape_rtf(text.as_str()).as_str());
+                out.push_str("\\b0\\par ");
+            }
+            Block::Paragraph(p) => {
+                let text = p.runs.iter().map(|r| r.text.as_str()).collect::<String>();
+                out.push_str(escape_rtf(text.as_str()).as_str());
+                out.push_str("\\par ");
+            }
+            Block::CodeBlock(c) => {
+                out.push_str("\\f0 ");
+                out.push_str(escape_rtf(c.code.as_str()).as_str());
+                out.push_str("\\par ");
+            }
+            Block::List(list) => {
+                for (idx, item) in list.items.iter().enumerate() {
+                    let marker = match list.list_type {
+                        ListType::Bullet => "\\'95 ".to_string(),
+                        ListType::Numbered => format!("{}. ", list.start_number + idx as u32),
+                        ListType::Checkbox => {
+                            if item.checked.unwrap_or(false) {
+                                "[x] ".to_string()
+                            } else {
+                                "[ ] ".to_string()
+                            }
+                        }
+                    };
+                    out.push_str(marker.as_str());
+                    for nested in &item.content {
+                        if let Block::Paragraph(p) = nested {
+                            let text = p.runs.iter().map(|r| r.text.as_str()).collect::<String>();
+                            out.push_str(escape_rtf(text.as_str()).as_str());
+                        }
+                    }
+                    out.push_str("\\par ");
+                }
+            }
+            Block::Table(table) => {
+                for row in &table.rows {
+                    let line = row
+                        .cells
+                        .iter()
+                        .map(|cell| {
+                            cell.blocks
+                                .iter()
+                                .filter_map(|b| match b {
+                                    Block::Paragraph(p) => Some(
+                                        p.runs
+                                            .iter()
+                                            .map(|r| r.text.as_str())
+                                            .collect::<String>(),
+                                    ),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    out.push_str(escape_rtf(line.as_str()).as_str());
+                    out.push_str("\\par ");
+                }
+            }
+            Block::Image(img) => {
+                out.push_str(escape_rtf(format!("[Image: {}]", img.alt_text).as_str()).as_str());
+                out.push_str("\\par ");
+            }
+            Block::HorizontalRule => out.push_str("---\\par "),
+            Block::PageBreak => out.push_str("\\page "),
+            Block::BlockQuote(q) => {
+                for nested in &q.blocks {
+                    if let Block::Paragraph(p) = nested {
+                        let text = p.runs.iter().map(|r| r.text.as_str()).collect::<String>();
+                        out.push_str("> ");
+                        out.push_str(escape_rtf(text.as_str()).as_str());
+                        out.push_str("\\par ");
+                    }
+                }
+            }
+        }
+    }
+    out.push('}');
+    out
+}
+
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -385,6 +487,7 @@ pub fn save_with_format(path: &Path, model: &DocumentModel) -> std::io::Result<(
         "txt" => export_txt(path, model),
         "md" | "markdown" => export_markdown(path, model),
         "html" | "htm" => export_html(path, model),
+        "rtf" => export_rtf(path, model),
         _ => save_docx(path, model),
     }
 }

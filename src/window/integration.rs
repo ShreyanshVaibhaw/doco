@@ -9,7 +9,8 @@ use windows::{
         Foundation::HWND,
         UI::{
             Controls::Dialogs::{
-                GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+                GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST,
+                OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
             },
             Shell::{DragFinish, DragQueryFileW, HDROP, SHARD_PATHW, SHAddToRecentDocs},
         },
@@ -191,6 +192,65 @@ pub fn pick_image_file(hwnd: HWND) -> Option<PathBuf> {
     };
 
     let ok = unsafe { GetOpenFileNameW(&mut open).as_bool() };
+    if !ok {
+        return None;
+    }
+
+    let len = file_buffer
+        .iter()
+        .position(|c| *c == 0)
+        .unwrap_or(file_buffer.len());
+    if len == 0 {
+        return None;
+    }
+    let path = OsString::from_wide(&file_buffer[..len]);
+    Some(PathBuf::from(path))
+}
+
+pub fn pick_save_file(
+    hwnd: HWND,
+    suggested_name: &str,
+    suggested_extension: &str,
+) -> Option<PathBuf> {
+    let mut file_buffer = vec![0u16; 260];
+    let suggested = if suggested_name.is_empty() {
+        format!("Untitled.{suggested_extension}")
+    } else {
+        suggested_name.to_string()
+    };
+    let suggested_w = suggested.encode_utf16().collect::<Vec<u16>>();
+    let suggested_len = suggested_w.len().min(file_buffer.len().saturating_sub(1));
+    file_buffer[..suggested_len].copy_from_slice(&suggested_w[..suggested_len]);
+    file_buffer[suggested_len] = 0;
+
+    let mut filter = String::new();
+    filter.push_str("Word Document (*.docx)\0*.docx\0");
+    filter.push_str("PDF (*.pdf)\0*.pdf\0");
+    filter.push_str("Text Document (*.txt)\0*.txt\0");
+    filter.push_str("Markdown (*.md)\0*.md\0");
+    filter.push_str("HTML (*.html)\0*.html;*.htm\0");
+    filter.push_str("RTF (*.rtf)\0*.rtf\0");
+    filter.push_str("All Files (*.*)\0*.*\0\0");
+    let filter_wide = filter.encode_utf16().collect::<Vec<u16>>();
+    let def_ext = suggested_extension
+        .trim_start_matches('.')
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+
+    let mut open = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: windows::core::PCWSTR::from_raw(filter_wide.as_ptr()),
+        lpstrDefExt: windows::core::PCWSTR::from_raw(def_ext.as_ptr()),
+        lpstrFile: windows::core::PWSTR(file_buffer.as_mut_ptr()),
+        nMaxFile: file_buffer.len() as u32,
+        lpstrTitle: w!("Save Document"),
+        Flags: OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT,
+        ..Default::default()
+    };
+
+    let ok = unsafe { GetSaveFileNameW(&mut open).as_bool() };
     if !ok {
         return None;
     }
