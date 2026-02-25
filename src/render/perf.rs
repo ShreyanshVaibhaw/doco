@@ -2,6 +2,9 @@ use std::time::{Duration, Instant};
 
 use crate::render::image_cache::ImageCacheStats;
 
+#[cfg(all(feature = "profiling", target_os = "windows"))]
+use std::sync::OnceLock;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PerformanceSnapshot {
     pub fps: f32,
@@ -63,6 +66,20 @@ impl DebugPerformancePanel {
     }
 }
 
+pub fn emit_startup_marker(stage: &str, elapsed_ms: f64) {
+    #[cfg(feature = "profiling")]
+    {
+        let message = format!("startup.{stage} {:.3} ms", elapsed_ms);
+        eprintln!("[profiling] {message}");
+        emit_etw_marker(message.as_str());
+    }
+
+    #[cfg(not(feature = "profiling"))]
+    {
+        let _ = (stage, elapsed_ms);
+    }
+}
+
 #[cfg(feature = "profiling")]
 pub struct ProfileGuard {
     name: &'static str,
@@ -72,6 +89,7 @@ pub struct ProfileGuard {
 #[cfg(feature = "profiling")]
 impl ProfileGuard {
     pub fn new(name: &'static str) -> Self {
+        emit_etw_marker(&format!("begin:{name}"));
         Self {
             name,
             start: Instant::now(),
@@ -84,6 +102,7 @@ impl Drop for ProfileGuard {
     fn drop(&mut self) {
         let elapsed_ms = self.start.elapsed().as_secs_f64() * 1000.0;
         eprintln!("[profiling] {} took {:.3} ms", self.name, elapsed_ms);
+        emit_etw_marker(&format!("end:{} {:.3} ms", self.name, elapsed_ms));
     }
 }
 
@@ -96,6 +115,41 @@ impl ProfileGuard {
         Self
     }
 }
+
+#[cfg(all(feature = "profiling", target_os = "windows"))]
+fn etw_provider_handle() -> Option<windows::Win32::System::Diagnostics::Etw::REGHANDLE> {
+    use windows::Win32::System::Diagnostics::Etw::{EventRegister, REGHANDLE};
+    use windows::core::GUID;
+
+    static HANDLE: OnceLock<Option<REGHANDLE>> = OnceLock::new();
+    *HANDLE.get_or_init(|| {
+        // Stable provider GUID dedicated to Doco profiling markers.
+        let provider = GUID::from_u128(0x6a77f9a8_4b1f_4f63_8c9a_3d3b4df20501);
+        let mut handle = REGHANDLE::default();
+        let status = unsafe { EventRegister(&provider, None, None, &mut handle) };
+        if status == 0 { Some(handle) } else { None }
+    })
+}
+
+#[cfg(all(feature = "profiling", target_os = "windows"))]
+pub fn emit_etw_marker(message: &str) {
+    use windows::Win32::System::Diagnostics::Etw::EventWriteString;
+    use windows::core::PCWSTR;
+
+    let Some(handle) = etw_provider_handle() else {
+        return;
+    };
+    let wide = message
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    unsafe {
+        let _ = EventWriteString(handle, 0, 0, PCWSTR(wide.as_ptr()));
+    }
+}
+
+#[cfg(not(all(feature = "profiling", target_os = "windows")))]
+pub fn emit_etw_marker(_message: &str) {}
 
 #[cfg(target_os = "windows")]
 pub fn query_process_working_set_bytes() -> Option<u64> {

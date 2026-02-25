@@ -1,7 +1,10 @@
+use std::time::Instant;
+
 use windows::core::Result;
 
 use crate::{
     document::export::AutoSaveManager,
+    render::perf::emit_startup_marker,
     document::model::DocumentModel,
     settings::{SettingsStore, schema::Settings},
     theme::ThemeManager,
@@ -54,6 +57,10 @@ pub struct StartupState {
     pub settings_loaded: bool,
     pub recent_files_loaded: bool,
     pub startup_budget_ms: u32,
+    pub theme_load_ms: u32,
+    pub settings_load_ms: u32,
+    pub window_init_ms: u32,
+    pub total_startup_ms: u32,
 }
 
 impl Default for StartupState {
@@ -64,21 +71,36 @@ impl Default for StartupState {
             settings_loaded: false,
             recent_files_loaded: false,
             startup_budget_ms: 500,
+            theme_load_ms: 0,
+            settings_load_ms: 0,
+            window_init_ms: 0,
+            total_startup_ms: 0,
         }
     }
 }
 
 impl StartupState {
-    fn finish_theme_load(&mut self) {
+    fn finish_theme_load(&mut self, elapsed_ms: u32) {
         self.theme_loaded = true;
+        self.theme_load_ms = elapsed_ms;
     }
 
-    fn finish_settings_load(&mut self) {
+    fn finish_settings_load(&mut self, elapsed_ms: u32) {
         self.settings_loaded = true;
+        self.settings_load_ms = elapsed_ms;
     }
 
     fn finish_recent_files_load(&mut self) {
         self.recent_files_loaded = true;
+    }
+
+    fn finish_window_init(&mut self, elapsed_ms: u32) {
+        self.window_init_ms = elapsed_ms;
+        self.window_shown_immediately = elapsed_ms <= 200;
+    }
+
+    fn finish_startup(&mut self, elapsed_ms: u32) {
+        self.total_startup_ms = elapsed_ms;
     }
 }
 
@@ -86,18 +108,31 @@ impl App {
     pub fn new() -> Result<Self> {
         crate::profile_scope!("app.new");
 
+        let startup_begin = Instant::now();
         let mut startup = StartupState::default();
-        let themes = ThemeManager::load()?;
-        startup.finish_theme_load();
 
+        let theme_begin = Instant::now();
+        let themes = ThemeManager::load()?;
+        let theme_ms = theme_begin.elapsed().as_millis() as u32;
+        startup.finish_theme_load(theme_ms);
+        emit_startup_marker("theme_load", theme_ms as f64);
+
+        let settings_begin = Instant::now();
         let settings = SettingsStore::load()
             .map(|store| store.settings().clone())
             .unwrap_or_default();
-        startup.finish_settings_load();
+        let settings_ms = settings_begin.elapsed().as_millis() as u32;
+        startup.finish_settings_load(settings_ms);
+        emit_startup_marker("settings_load", settings_ms as f64);
         startup.finish_recent_files_load();
 
         let _ = themes.apply_preference(&settings.appearance.theme);
+
+        let window_begin = Instant::now();
         let window = AppWindow::new(themes, settings.clone())?;
+        let window_ms = window_begin.elapsed().as_millis() as u32;
+        startup.finish_window_init(window_ms);
+        emit_startup_marker("window_init", window_ms as f64);
 
         let mut state = AppState::default();
         state.settings = settings;
@@ -113,6 +148,16 @@ impl App {
                 .as_seconds()
                 .unwrap_or(60),
         );
+
+        let total_ms = startup_begin.elapsed().as_millis() as u32;
+        startup.finish_startup(total_ms);
+        emit_startup_marker("total", total_ms as f64);
+        if total_ms > startup.startup_budget_ms {
+            eprintln!(
+                "Startup budget exceeded: {} ms > {} ms",
+                total_ms, startup.startup_budget_ms
+            );
+        }
 
         Ok(Self {
             window,

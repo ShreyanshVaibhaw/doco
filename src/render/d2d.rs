@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{mem::ManuallyDrop, path::Path};
 
@@ -171,6 +173,8 @@ pub struct D2DRenderer {
     dwrite_factory: IDWriteFactory,
     theme: Theme,
     debug_panel: DebugPerformancePanel,
+    brush_cache: RefCell<HashMap<u32, ID2D1SolidColorBrush>>,
+    default_text_format: RefCell<Option<IDWriteTextFormat>>,
 }
 
 impl D2DRenderer {
@@ -206,6 +210,8 @@ impl D2DRenderer {
                 dwrite_factory,
                 theme,
                 debug_panel: DebugPerformancePanel::default(),
+                brush_cache: RefCell::new(HashMap::new()),
+                default_text_format: RefCell::new(None),
             };
 
             renderer.recreate_target_bitmap()?;
@@ -382,6 +388,7 @@ impl D2DRenderer {
 
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+        self.brush_cache.borrow_mut().clear();
     }
 
     pub fn debug_panel(&self) -> &DebugPerformancePanel {
@@ -2527,8 +2534,12 @@ impl D2DRenderer {
     }
 
     fn create_text_format(&self) -> Result<IDWriteTextFormat> {
+        if let Some(existing) = self.default_text_format.borrow().as_ref() {
+            return Ok(existing.clone());
+        }
+
         unsafe {
-            match self.dwrite_factory.CreateTextFormat(
+            let format = match self.dwrite_factory.CreateTextFormat(
                 w!("Segoe UI Variable"),
                 None,
                 windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL,
@@ -2537,7 +2548,7 @@ impl D2DRenderer {
                 14.0,
                 w!("en-US"),
             ) {
-                Ok(format) => Ok(format),
+                Ok(format) => format,
                 Err(_) => self.dwrite_factory.CreateTextFormat(
                     w!("Segoe UI"),
                     None,
@@ -2546,8 +2557,11 @@ impl D2DRenderer {
                     windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STRETCH_NORMAL,
                     14.0,
                     w!("en-US"),
-                ),
-            }
+                )?,
+            };
+
+            *self.default_text_format.borrow_mut() = Some(format.clone());
+            Ok(format)
         }
     }
 
@@ -2555,7 +2569,23 @@ impl D2DRenderer {
         &self,
         color: windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F,
     ) -> Result<ID2D1SolidColorBrush> {
-        unsafe { self.d2d_context.CreateSolidColorBrush(&color, None) }
+        let key = Self::brush_color_key(color);
+        if let Some(existing) = self.brush_cache.borrow().get(&key).cloned() {
+            return Ok(existing);
+        }
+
+        let brush = unsafe { self.d2d_context.CreateSolidColorBrush(&color, None)? };
+        self.brush_cache.borrow_mut().insert(key, brush.clone());
+        Ok(brush)
+    }
+
+    fn brush_color_key(color: windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F) -> u32 {
+        let quantize = |v: f32| -> u32 { (v.clamp(0.0, 1.0) * 255.0).round() as u32 };
+        let r = quantize(color.r);
+        let g = quantize(color.g);
+        let b = quantize(color.b);
+        let a = quantize(color.a);
+        (a << 24) | (r << 16) | (g << 8) | b
     }
 
     unsafe fn recreate_target_bitmap(&mut self) -> Result<()> {
@@ -2581,6 +2611,7 @@ impl D2DRenderer {
             let _ = self.d2d_context.SetDpi(self.dpi, self.dpi);
         }
         self.target_bitmap = Some(bitmap);
+        self.brush_cache.borrow_mut().clear();
 
         Ok(())
     }

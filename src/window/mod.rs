@@ -80,6 +80,7 @@ use crate::{
     render::canvas::PageLayoutMode,
     render::d2d::{D2DRenderer, ShellRenderState},
     render::image_cache::{ImageDecodeCache, interpolation_hint, resolve_image_data},
+    render::perf::emit_startup_marker,
     settings::schema::{Settings, SettingsCategory, SidebarDefaultPanel},
     theme::{
         Theme, ThemeManager,
@@ -441,6 +442,31 @@ fn load_document_for_path(path: &Path) -> DocumentModel {
         model.metadata.format = detected;
     }
     model
+}
+
+fn process_startup_file_queue(state: &mut WindowState) -> bool {
+    if state.startup_files.is_empty() {
+        return false;
+    }
+
+    let path = state.startup_files.remove(0);
+    let title = document_title_from_path(path.as_path());
+    let document = load_document_for_path(path.as_path());
+    state
+        .tabs
+        .open_document_tab(title.clone(), Some(path.clone()), document);
+    state.jump_list.add_recent_file(path);
+
+    if state.startup_files.is_empty() {
+        state.app_state.status_text = format!("Opened {title}");
+    } else {
+        state.app_state.status_text = format!(
+            "Opening startup files... {} remaining",
+            state.startup_files.len()
+        );
+    }
+
+    true
 }
 
 fn default_extension_for_document(state: &WindowState, format: DocumentFormat) -> String {
@@ -2244,6 +2270,14 @@ fn sync_runtime_from_settings(state: &mut WindowState, hwnd: HWND) {
         state.app_state.autosave = crate::document::export::AutoSaveManager::new(autosave_seconds);
     }
 
+    let desired_image_cache_bytes = (state.app_state.settings.performance.max_image_cache_mb as usize)
+        .max(32)
+        * 1024
+        * 1024;
+    if state.image_cache.max_bytes != desired_image_cache_bytes {
+        state.image_cache.set_memory_budget(desired_image_cache_bytes);
+    }
+
     let next_ui_scale = state.app_state.settings.appearance.ui_scale.as_factor();
     let needs_relayout = prev_show_toolbar != state.app_state.show_toolbar
         || prev_show_sidebar != state.app_state.show_sidebar
@@ -3015,6 +3049,7 @@ unsafe extern "system" fn window_proc(
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_CREATE => {
+            let create_begin = Instant::now();
             unsafe { DragAcceptFiles(hwnd, true) };
 
             let mut client = RECT::default();
@@ -3036,23 +3071,10 @@ unsafe extern "system" fn window_proc(
 
                 let mut opened_any = false;
                 if !state.startup_files.is_empty() {
-                    state.dropped_files = state.startup_files.clone();
                     state.app_state.status_text = format!(
-                        "Opening {} file(s) from command line",
+                        "Opening {} file(s) from command line in background",
                         state.startup_files.len()
                     );
-                    for path in &state.startup_files {
-                        state.jump_list.add_recent_file(path.clone());
-                        let title = path
-                            .file_name()
-                            .and_then(|v| v.to_str())
-                            .unwrap_or("Document")
-                            .to_string();
-                        let document = load_document_for_path(path.as_path());
-                        state
-                            .tabs
-                            .open_document_tab(title, Some(path.clone()), document);
-                    }
                     opened_any = true;
                 }
 
@@ -3069,6 +3091,7 @@ unsafe extern "system" fn window_proc(
 
                 sync_sidebar_with_active_tab(state);
             }
+            emit_startup_marker("window_create", create_begin.elapsed().as_secs_f64() * 1000.0);
 
             LRESULT(0)
         }
@@ -3178,6 +3201,19 @@ unsafe extern "system" fn window_proc(
                 if matches!(background.kind, BackgroundKind::AnimatedGradient { .. }) {
                     needs_next_frame = true;
                 }
+
+                if !state.startup_files.is_empty() {
+                    let startup_chunk_begin = Instant::now();
+                    if process_startup_file_queue(state) {
+                        sync_sidebar_with_active_tab(state);
+                        needs_next_frame = true;
+                        emit_startup_marker(
+                            "startup_file_open",
+                            startup_chunk_begin.elapsed().as_secs_f64() * 1000.0,
+                        );
+                    }
+                }
+
                 let shell = build_shell_render_state(state);
                 if let Some(renderer) = &mut state.renderer {
                     let _ = renderer.render(&shell);
