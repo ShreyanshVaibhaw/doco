@@ -5,6 +5,7 @@ use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
 use crate::{
     document::model::DocumentModel,
     editor::cursor::CursorState,
+    render::animation::{Animation, Easing},
     render::canvas::CanvasState,
     theme::Theme,
     ui::{InputEvent, Point, Rect, UIComponent},
@@ -17,6 +18,7 @@ const TAB_GAP: f32 = 6.0;
 const TAB_BAR_PADDING: f32 = 8.0;
 const NEW_TAB_BUTTON_WIDTH: f32 = 28.0;
 const OVERFLOW_BUTTON_WIDTH: f32 = 24.0;
+const TAB_SWITCH_ANIMATION_S: f32 = 0.15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabKind {
@@ -65,6 +67,71 @@ impl TabState {
 }
 
 #[derive(Debug, Clone)]
+struct TabTransition {
+    from_index: usize,
+    to_index: usize,
+    progress: f32,
+    slide_offset: f32,
+    progress_anim: Option<Animation>,
+    slide_anim: Option<Animation>,
+}
+
+impl TabTransition {
+    fn new(from_index: usize, to_index: usize) -> Self {
+        Self {
+            from_index,
+            to_index,
+            progress: 0.0,
+            slide_offset: 18.0,
+            progress_anim: Some(Animation::new(
+                0.0,
+                1.0,
+                TAB_SWITCH_ANIMATION_S,
+                Easing::EaseOutCubic,
+            )),
+            slide_anim: Some(Animation::new(
+                18.0,
+                0.0,
+                TAB_SWITCH_ANIMATION_S,
+                Easing::EaseOutCubic,
+            )),
+        }
+    }
+
+    fn update(&mut self, dt_s: f32, reduce_motion: bool) -> bool {
+        if reduce_motion {
+            self.progress = 1.0;
+            self.slide_offset = 0.0;
+            self.progress_anim = None;
+            self.slide_anim = None;
+            return false;
+        }
+
+        let mut animating = false;
+        if let Some(anim) = &mut self.progress_anim {
+            if anim.update(dt_s) {
+                self.progress = anim.current_value.clamp(0.0, 1.0);
+                animating = true;
+            } else {
+                self.progress = anim.end_value.clamp(0.0, 1.0);
+                self.progress_anim = None;
+            }
+        }
+        if let Some(anim) = &mut self.slide_anim {
+            if anim.update(dt_s) {
+                self.slide_offset = anim.current_value;
+                animating = true;
+            } else {
+                self.slide_offset = anim.end_value;
+                self.slide_anim = None;
+            }
+        }
+
+        animating
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct TabsBar {
     bounds: Rect,
     visible: bool,
@@ -79,6 +146,8 @@ pub struct TabsBar {
     pub overflow_right_rect: Rect,
     pub hovered: Option<usize>,
     dragging_tab: Option<usize>,
+    transition: Option<TabTransition>,
+    pub reduce_motion: bool,
     next_id: u64,
 }
 
@@ -104,6 +173,8 @@ impl TabsBar {
             overflow_right_rect: Rect::default(),
             hovered: None,
             dragging_tab: None,
+            transition: None,
+            reduce_motion: false,
             next_id: 1,
         };
         this.ensure_welcome_tab();
@@ -119,6 +190,7 @@ impl TabsBar {
     }
 
     pub fn new_blank_tab(&mut self) -> usize {
+        let previous_active = self.active;
         let id = self.next_id;
         self.next_id += 1;
 
@@ -131,6 +203,7 @@ impl TabsBar {
 
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+        self.start_switch_transition(previous_active, self.active);
         self.remove_welcome_if_needed();
         self.ensure_active_visible();
         self.recalc_tab_layout();
@@ -143,11 +216,13 @@ impl TabsBar {
         path: Option<PathBuf>,
         document: DocumentModel,
     ) -> usize {
+        let previous_active = self.active;
         let id = self.next_id;
         self.next_id += 1;
         self.tabs
             .push(TabState::from_document(id, title, path, document));
         self.active = self.tabs.len() - 1;
+        self.start_switch_transition(previous_active, self.active);
         self.remove_welcome_if_needed();
         self.ensure_active_visible();
         self.recalc_tab_layout();
@@ -202,7 +277,9 @@ impl TabsBar {
     }
 
     pub fn set_active(&mut self, index: usize) {
+        let previous_active = self.active;
         self.active = index.min(self.tabs.len().saturating_sub(1));
+        self.start_switch_transition(previous_active, self.active);
         self.ensure_active_visible();
         self.recalc_tab_layout();
     }
@@ -211,7 +288,9 @@ impl TabsBar {
         if self.tabs.is_empty() {
             return;
         }
+        let previous_active = self.active;
         self.active = (self.active + 1) % self.tabs.len();
+        self.start_switch_transition(previous_active, self.active);
         self.ensure_active_visible();
         self.recalc_tab_layout();
     }
@@ -220,11 +299,13 @@ impl TabsBar {
         if self.tabs.is_empty() {
             return;
         }
+        let previous_active = self.active;
         if self.active == 0 {
             self.active = self.tabs.len() - 1;
         } else {
             self.active -= 1;
         }
+        self.start_switch_transition(previous_active, self.active);
         self.ensure_active_visible();
         self.recalc_tab_layout();
     }
@@ -235,7 +316,9 @@ impl TabsBar {
         }
         let index = one_based - 1;
         if index < self.tabs.len() {
+            let previous_active = self.active;
             self.active = index;
+            self.start_switch_transition(previous_active, self.active);
             self.ensure_active_visible();
             self.recalc_tab_layout();
         }
@@ -334,6 +417,40 @@ impl TabsBar {
             return self.close_tab(index);
         }
         false
+    }
+
+    pub fn tick(&mut self, dt_s: f32) -> bool {
+        if let Some(transition) = &mut self.transition {
+            let animating = transition.update(dt_s, self.reduce_motion);
+            if !animating {
+                self.transition = None;
+                return false;
+            }
+            return true;
+        }
+        false
+    }
+
+    pub fn transition_progress(&self) -> f32 {
+        self.transition
+            .as_ref()
+            .map(|transition| transition.progress)
+            .unwrap_or(1.0)
+    }
+
+    pub fn transition_slide_offset(&self) -> f32 {
+        self.transition
+            .as_ref()
+            .map(|transition| transition.slide_offset)
+            .unwrap_or(0.0)
+    }
+
+    fn start_switch_transition(&mut self, from: usize, to: usize) {
+        if from == to || self.reduce_motion {
+            self.transition = None;
+            return;
+        }
+        self.transition = Some(TabTransition::new(from, to));
     }
 
     fn ensure_active_visible(&mut self) {
@@ -594,5 +711,25 @@ mod tests {
 
         assert_ne!(tabs.tabs[0].id, first);
         assert!(tabs.tabs.iter().any(|tab| tab.id == first));
+    }
+
+    #[test]
+    fn switching_tabs_starts_transition() {
+        let mut tabs = TabsBar::new();
+        tabs.new_blank_tab();
+        tabs.new_blank_tab();
+        tabs.layout(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 820.0,
+                height: TAB_HEIGHT,
+            },
+            96.0,
+        );
+        tabs.set_active(0);
+        assert!(tabs.transition_progress() < 1.0);
+        let _ = tabs.tick(0.25);
+        assert_eq!(tabs.transition_progress(), 1.0);
     }
 }

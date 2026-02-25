@@ -12,6 +12,7 @@ use crate::{
 const PALETTE_WIDTH: f32 = 600.0;
 const PALETTE_MAX_HEIGHT: f32 = 400.0;
 const PALETTE_FADE_S: f32 = 0.10;
+const PALETTE_SLIDE_S: f32 = 0.10;
 
 pub struct Command {
     pub id: &'static str,
@@ -54,7 +55,10 @@ pub struct CommandPalette {
     bounds: Rect,
     visible: bool,
     opacity: f32,
+    slide_offset: f32,
+    pub reduce_motion: bool,
     fade: Option<Animation>,
+    slide: Option<Animation>,
     pub query: String,
     pub mode: QuickActionMode,
     pub selected: usize,
@@ -77,7 +81,10 @@ impl CommandPalette {
             bounds: Rect::default(),
             visible: false,
             opacity: 0.0,
+            slide_offset: -12.0,
+            reduce_motion: false,
             fade: None,
+            slide: None,
             query: String::new(),
             mode: QuickActionMode::Command,
             selected: 0,
@@ -93,15 +100,26 @@ impl CommandPalette {
 
     pub fn open(&mut self) {
         self.visible = true;
-        self.opacity = 0.0;
-        self.fade = Some(Animation::new(0.0, 1.0, PALETTE_FADE_S, Easing::EaseOutCubic));
+        if self.reduce_motion {
+            self.opacity = 1.0;
+            self.slide_offset = 0.0;
+            self.fade = None;
+            self.slide = None;
+        } else {
+            self.opacity = 0.0;
+            self.slide_offset = -12.0;
+            self.fade = Some(Animation::new(0.0, 1.0, PALETTE_FADE_S, Easing::EaseOutCubic));
+            self.slide = Some(Animation::new(-12.0, 0.0, PALETTE_SLIDE_S, Easing::EaseOutCubic));
+        }
         self.refresh_results(None);
     }
 
     pub fn close(&mut self) {
         self.visible = false;
         self.opacity = 0.0;
+        self.slide_offset = -12.0;
         self.fade = None;
+        self.slide = None;
     }
 
     pub fn is_open(&self) -> bool {
@@ -110,13 +128,39 @@ impl CommandPalette {
 
     pub fn tick(&mut self, dt_s: f32) {
         if let Some(anim) = &mut self.fade {
-            if anim.update(dt_s) {
+            if anim.update_respecting_motion_pref(dt_s, self.reduce_motion) {
                 self.opacity = anim.current_value.clamp(0.0, 1.0);
             } else {
                 self.opacity = anim.end_value.clamp(0.0, 1.0);
                 self.fade = None;
             }
         }
+        if let Some(anim) = &mut self.slide {
+            if anim.update_respecting_motion_pref(dt_s, self.reduce_motion) {
+                self.slide_offset = anim.current_value;
+            } else {
+                self.slide_offset = anim.end_value;
+                self.slide = None;
+            }
+        }
+    }
+
+    pub fn set_reduce_motion(&mut self, reduce_motion: bool) {
+        self.reduce_motion = reduce_motion;
+        if reduce_motion {
+            self.opacity = if self.visible { 1.0 } else { 0.0 };
+            self.slide_offset = 0.0;
+            self.fade = None;
+            self.slide = None;
+        }
+    }
+
+    pub fn opacity(&self) -> f32 {
+        self.opacity
+    }
+
+    pub fn slide_offset(&self) -> f32 {
+        self.slide_offset
     }
 
     pub fn set_query(&mut self, text: impl Into<String>) {
@@ -382,7 +426,9 @@ impl UIComponent for CommandPalette {
         self.visible = visible;
         if !visible {
             self.opacity = 0.0;
+            self.slide_offset = -12.0;
             self.fade = None;
+            self.slide = None;
         }
     }
 
@@ -742,5 +788,14 @@ mod tests {
         let mut palette = CommandPalette::new();
         palette.set_query(">toggle");
         assert!(!palette.grouped_result_headers.is_empty());
+    }
+
+    #[test]
+    fn reduce_motion_disables_open_animation() {
+        let mut palette = CommandPalette::new();
+        palette.set_reduce_motion(true);
+        palette.open();
+        assert_eq!(palette.opacity(), 1.0);
+        assert_eq!(palette.slide_offset(), 0.0);
     }
 }

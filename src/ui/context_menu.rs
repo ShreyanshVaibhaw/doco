@@ -52,6 +52,7 @@ pub struct ContextMenuItem {
 pub struct ContextMenu {
     bounds: Rect,
     visible: bool,
+    pub reduce_motion: bool,
     pub kind: Option<ContextMenuKind>,
     pub items: Vec<ContextMenuItem>,
     pub selected_index: Option<usize>,
@@ -73,8 +74,15 @@ impl ContextMenu {
         };
         self.visible = true;
         self.selected_index = None;
-        self.fade_anim = Some(Animation::new(0.0, 1.0, 0.08, Easing::EaseOutCubic));
-        self.scale_anim = Some(Animation::new(0.95, 1.0, 0.08, Easing::EaseOutCubic));
+        if self.reduce_motion {
+            self.opacity = 1.0;
+            self.scale = 1.0;
+            self.fade_anim = None;
+            self.scale_anim = None;
+        } else {
+            self.fade_anim = Some(Animation::new(0.0, 1.0, 0.08, Easing::EaseOutCubic));
+            self.scale_anim = Some(Animation::new(0.95, 1.0, 0.08, Easing::EaseOutCubic));
+        }
     }
 
     pub fn close(&mut self) {
@@ -90,7 +98,7 @@ impl ContextMenu {
 
     pub fn tick(&mut self, dt_s: f32) {
         if let Some(anim) = &mut self.fade_anim {
-            if anim.update(dt_s) {
+            if anim.update_respecting_motion_pref(dt_s, self.reduce_motion) {
                 self.opacity = anim.current_value.clamp(0.0, 1.0);
             } else {
                 self.opacity = anim.end_value.clamp(0.0, 1.0);
@@ -99,7 +107,7 @@ impl ContextMenu {
         }
 
         if let Some(anim) = &mut self.scale_anim {
-            if anim.update(dt_s) {
+            if anim.update_respecting_motion_pref(dt_s, self.reduce_motion) {
                 self.scale = anim.current_value;
             } else {
                 self.scale = anim.end_value;

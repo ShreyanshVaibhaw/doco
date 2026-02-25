@@ -771,6 +771,22 @@ pub struct LoadingState {
     pub message: String,
 }
 
+impl LoadingState {
+    pub fn for_kind(kind: LoadingKind, progress: Option<f32>) -> Self {
+        let message = match kind {
+            LoadingKind::Document => "Loading document...".to_string(),
+            LoadingKind::PdfPage => "Rendering PDF page...".to_string(),
+            LoadingKind::Image => "Loading image...".to_string(),
+            LoadingKind::LongOperation => "Working...".to_string(),
+        };
+        Self {
+            kind,
+            progress: progress.map(|v| v.clamp(0.0, 1.0)),
+            message,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorDialogKind {
     FileNotFound,
@@ -786,4 +802,61 @@ pub struct ErrorDialogState {
     pub title: String,
     pub body: String,
     pub retry_label: Option<String>,
+}
+
+impl ErrorDialogState {
+    pub fn from_kind(kind: ErrorDialogKind, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        match kind {
+            ErrorDialogKind::FileNotFound => Self {
+                kind,
+                title: "File not found".to_string(),
+                body: format!("{detail}\nUse Browse to locate the file."),
+                retry_label: Some("Browse".to_string()),
+            },
+            ErrorDialogKind::CorruptedDocument => Self {
+                kind,
+                title: "Document looks corrupted".to_string(),
+                body: format!("{detail}\nDoco will show recoverable content only."),
+                retry_label: None,
+            },
+            ErrorDialogKind::SaveFailed => Self {
+                kind,
+                title: "Save failed".to_string(),
+                body: format!("{detail}\nTry saving to a different location."),
+                retry_label: Some("Retry Save".to_string()),
+            },
+            ErrorDialogKind::OutOfMemory => Self {
+                kind,
+                title: "Out of memory".to_string(),
+                body: format!("{detail}\nClose large documents or reduce caches and try again."),
+                retry_label: Some("Retry".to_string()),
+            },
+            ErrorDialogKind::PanicRecovery => Self {
+                kind,
+                title: "Unexpected error".to_string(),
+                body: format!("{detail}\nRecovery data may be available."),
+                retry_label: Some("Open Recovery".to_string()),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod polish_tests {
+    use super::{ErrorDialogKind, ErrorDialogState, LoadingKind, LoadingState};
+
+    #[test]
+    fn loading_factory_clamps_progress() {
+        let state = LoadingState::for_kind(LoadingKind::LongOperation, Some(1.4));
+        assert_eq!(state.progress, Some(1.0));
+        assert!(state.message.contains("Working"));
+    }
+
+    #[test]
+    fn save_failed_dialog_exposes_retry() {
+        let dialog = ErrorDialogState::from_kind(ErrorDialogKind::SaveFailed, "Disk full");
+        assert_eq!(dialog.retry_label.as_deref(), Some("Retry Save"));
+        assert!(dialog.body.contains("different location"));
+    }
 }

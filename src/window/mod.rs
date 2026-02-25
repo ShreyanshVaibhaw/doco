@@ -87,17 +87,20 @@ use crate::{
         backgrounds::{BackgroundKind, from_canvas_preference},
     },
     ui::{
-        InputEvent as UiInputEvent, Point as UiPoint, Rect as UiRect, UIComponent,
+        AccessibilityPreferences, InputEvent as UiInputEvent, Point as UiPoint, Rect as UiRect,
+        UIComponent,
         command_palette::CommandPalette,
         dialog::Dialog,
         sidebar::{SearchResultItem, Sidebar, SidebarIntent, SidebarPanel},
         statusbar::{StatusAction, StatusBar, StatusBarInfo},
         tabs::{TabKind, TabsBar},
+        toast::Toast,
         toolbar::{Toolbar, ToolbarAction},
     },
     window::integration::{
         DropAction, JumpListState, PrintState, extract_drop_payload, parse_startup_files_from_cli,
-        pick_image_file, pick_save_file, open_print_dialog, send_toast_notification,
+        pick_image_file, pick_save_file, open_print_dialog, query_accessibility_preferences,
+        send_toast_notification,
     },
 };
 
@@ -216,6 +219,8 @@ struct WindowState {
     goto_input: String,
     toolbar: Toolbar,
     statusbar: StatusBar,
+    toast: Toast,
+    accessibility: AccessibilityPreferences,
     last_ui_tick: Instant,
     sidebar_resizing: bool,
     sidebar_resize_grab_offset: f32,
@@ -311,6 +316,8 @@ impl AppWindow {
             goto_input: String::new(),
             toolbar: Toolbar::default(),
             statusbar: StatusBar::default(),
+            toast: Toast::default(),
+            accessibility: query_accessibility_preferences(),
             last_ui_tick: Instant::now(),
             sidebar_resizing: false,
             sidebar_resize_grab_offset: 0.0,
@@ -683,6 +690,9 @@ fn export_active_document(state: &mut WindowState, hwnd: HWND, ext: &str) -> boo
     match result {
         Ok(_) => {
             state.app_state.status_text = format!("Exported {}", path.display());
+            state
+                .toast
+                .push_export_complete(format!("{}", path.display()).as_str());
             send_toast_notification(
                 "Export complete",
                 format!("{}", path.display()).as_str(),
@@ -2207,6 +2217,15 @@ fn relayout_shell(state: &mut WindowState, width: f32, height: f32) {
         },
         state.dpi,
     );
+    state.toast.layout(
+        UiRect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        },
+        state.dpi,
+    );
 
     let (canvas_w, canvas_h) = canvas_viewport_size(state, width, height);
     if let Some(tab) = state.tabs.active_tab_mut() {
@@ -2239,6 +2258,19 @@ fn set_settings_visible(state: &mut WindowState, visible: bool) {
     state.settings_dialog.set_visible(visible);
 }
 
+fn apply_accessibility_preferences(state: &mut WindowState) {
+    let reduce_motion =
+        state.accessibility.reduce_motion || !state.app_state.settings.performance.animated_backgrounds;
+    state.sidebar.reduce_motion = reduce_motion;
+    state.command_palette.set_reduce_motion(reduce_motion);
+    state.toolbar.set_reduce_motion(reduce_motion);
+    state.tabs.reduce_motion = reduce_motion;
+    state.toast.reduce_motion = reduce_motion;
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        tab.canvas.set_reduce_motion(reduce_motion);
+    }
+}
+
 fn sync_runtime_from_settings(state: &mut WindowState, hwnd: HWND) {
     let settings = state.settings_dialog.settings().clone();
 
@@ -2254,6 +2286,7 @@ fn sync_runtime_from_settings(state: &mut WindowState, hwnd: HWND) {
     state.app_state.show_sidebar = state.app_state.settings.appearance.show_sidebar;
     state.app_state.show_statusbar = state.app_state.settings.appearance.show_status_bar;
     state.app_state.show_tabs = state.app_state.settings.appearance.show_tab_bar;
+    apply_accessibility_preferences(state);
 
     let preferred_panel =
         sidebar_panel_from_preference(state.app_state.settings.appearance.sidebar_default_panel);
@@ -2737,9 +2770,22 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
     };
     let sidebar_rows = state.sidebar.panel_rows(24);
     let command_palette_open = state.command_palette.is_open();
+    let command_palette_opacity = state.command_palette.opacity();
+    let command_palette_offset_y = state.command_palette.slide_offset();
     let command_palette_query = state.command_palette.query.clone();
     let command_palette_selected = state.command_palette.selected;
     let command_palette_results = state.command_palette.result_labels(8);
+    let toast_entries = state
+        .toast
+        .entries
+        .iter()
+        .map(|entry| crate::render::d2d::ToastShellItem {
+            title: entry.title.clone(),
+            body: entry.body.clone(),
+            opacity: entry.opacity.clamp(0.0, 1.0),
+            slide_offset: entry.slide,
+        })
+        .collect::<Vec<_>>();
     let settings_visible = state.settings_dialog.is_open();
     let settings_query = state.settings_dialog.search_query().to_string();
     let settings_category = state.settings_dialog.selected_category().title().to_string();
@@ -2867,6 +2913,8 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         status_text: state.app_state.status_text.clone(),
         tab_titles,
         active_tab,
+        tab_transition_progress: state.tabs.transition_progress(),
+        tab_transition_offset: state.tabs.transition_slide_offset(),
         tab_has_overflow_left: state.tabs.overflow_offset > 0,
         tab_has_overflow_right: state.tabs.overflow_offset + state.tabs.tab_rects.len() < state.tabs.tabs.len(),
         toolbar_labels: state
@@ -2876,10 +2924,15 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
             .filter(|b| !b.label.is_empty())
             .map(|b| b.label.to_string())
             .collect(),
+        toolbar_dropdown_open: state.toolbar.dropdown.open.is_some(),
+        toolbar_dropdown_opacity: state.toolbar.dropdown.opacity,
+        toolbar_dropdown_scale: state.toolbar.dropdown.scale,
         active_sidebar_panel: active_sidebar_panel.to_string(),
         sidebar_summary,
         sidebar_rows,
         command_palette_open,
+        command_palette_opacity,
+        command_palette_offset_y,
         command_palette_query,
         command_palette_results,
         command_palette_selected,
@@ -2938,6 +2991,9 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
                 alt_text: overlay.alt_text.clone(),
             })
             .collect(),
+        toast_entries,
+        accessibility_high_contrast: state.accessibility.high_contrast,
+        accessibility_reduce_motion: state.accessibility.reduce_motion,
         image_toolbar_visible: state.selected_image.is_some(),
         image_properties_visible: state.image_properties_visible,
         image_selected_size: selected_image
@@ -3060,7 +3116,9 @@ unsafe extern "system" fn window_proc(
             let _ = unsafe { GetClientRect(hwnd, &mut client) };
 
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
+                state.accessibility = query_accessibility_preferences();
                 let _ = sync_theme_from_settings(state);
+                apply_accessibility_preferences(state);
                 unsafe { apply_window_effects(hwnd, state.theme.is_dark) };
                 let width = (client.right - client.left).max(1) as u32;
                 let height = (client.bottom - client.top).max(1) as u32;
@@ -3149,6 +3207,8 @@ unsafe extern "system" fn window_proc(
         }
         WM_SETTINGCHANGE => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
+                state.accessibility = query_accessibility_preferences();
+                apply_accessibility_preferences(state);
                 let changed = sync_theme_from_settings(state);
                 if changed {
                     if let Some(renderer) = &mut state.renderer {
@@ -3156,6 +3216,11 @@ unsafe extern "system" fn window_proc(
                     }
                     unsafe { apply_window_effects(hwnd, state.theme.is_dark) };
                     state.app_state.status_text = format!("Theme updated: {}", state.theme.name);
+                } else {
+                    state.app_state.status_text = format!(
+                        "Accessibility updated (high contrast: {}, reduce motion: {})",
+                        state.accessibility.high_contrast, state.accessibility.reduce_motion
+                    );
                 }
             }
             let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
@@ -3171,6 +3236,9 @@ unsafe extern "system" fn window_proc(
                 state.last_ui_tick = now;
                 state.sidebar.tick(dt);
                 state.command_palette.tick(dt);
+                let tabs_animating = state.tabs.tick(dt);
+                state.toolbar.tick(dt);
+                state.toast.tick(dt);
                 if state.app_state.show_settings != state.settings_dialog.is_open() {
                     state
                         .settings_dialog
@@ -3180,12 +3248,31 @@ unsafe extern "system" fn window_proc(
                 sync_runtime_from_settings(state, hwnd);
                 state.app_state.show_settings = state.settings_dialog.is_open();
                 let mut needs_next_frame = false;
+                needs_next_frame |= tabs_animating;
+                needs_next_frame |= !state.toast.entries.is_empty();
+                if state.command_palette.is_open()
+                    && !state.accessibility.reduce_motion
+                    && (state.command_palette.opacity() < 0.999
+                        || state.command_palette.slide_offset().abs() > 0.05)
+                {
+                    needs_next_frame = true;
+                }
+                if state.toolbar.dropdown.open.is_some()
+                    && !state.accessibility.reduce_motion
+                    && (state.toolbar.dropdown.opacity < 0.999
+                        || (1.0 - state.toolbar.dropdown.scale).abs() > 0.01)
+                {
+                    needs_next_frame = true;
+                }
                 if let Some(tab) = state.tabs.active_tab_mut() {
                     needs_next_frame |= tab.canvas.update(dt);
                     tab.canvas.clamp_scroll(&tab.document);
                     if let Ok(Some(path)) = state.app_state.autosave.tick(&tab.document) {
                         state.app_state.status_text =
                             format!("Auto-saved recovery snapshot: {}", path.display());
+                        state
+                            .toast
+                            .push_recovery_saved(format!("{}", path.display()).as_str());
                         send_toast_notification(
                             "Auto-recovery saved",
                             format!("{}", path.display()).as_str(),

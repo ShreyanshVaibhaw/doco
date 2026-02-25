@@ -81,6 +81,14 @@ pub struct CanvasTableShellItem {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct ToastShellItem {
+    pub title: String,
+    pub body: String,
+    pub opacity: f32,
+    pub slide_offset: f32,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ShellRenderState {
     pub ui_scale: f32,
     pub show_tabs: bool,
@@ -92,13 +100,20 @@ pub struct ShellRenderState {
     pub status_text: String,
     pub tab_titles: Vec<String>,
     pub active_tab: usize,
+    pub tab_transition_progress: f32,
+    pub tab_transition_offset: f32,
     pub tab_has_overflow_left: bool,
     pub tab_has_overflow_right: bool,
     pub toolbar_labels: Vec<String>,
+    pub toolbar_dropdown_open: bool,
+    pub toolbar_dropdown_opacity: f32,
+    pub toolbar_dropdown_scale: f32,
     pub active_sidebar_panel: String,
     pub sidebar_summary: String,
     pub sidebar_rows: Vec<String>,
     pub command_palette_open: bool,
+    pub command_palette_opacity: f32,
+    pub command_palette_offset_y: f32,
     pub command_palette_query: String,
     pub command_palette_results: Vec<String>,
     pub command_palette_selected: usize,
@@ -147,6 +162,9 @@ pub struct ShellRenderState {
     pub canvas_scroll_y: f32,
     pub canvas_images: Vec<CanvasImageShellItem>,
     pub canvas_tables: Vec<CanvasTableShellItem>,
+    pub toast_entries: Vec<ToastShellItem>,
+    pub accessibility_high_contrast: bool,
+    pub accessibility_reduce_motion: bool,
     pub image_toolbar_visible: bool,
     pub image_properties_visible: bool,
     pub image_selected_size: String,
@@ -447,10 +465,20 @@ impl D2DRenderer {
                 bottom: height,
             };
 
-            let tab_brush = self.create_brush(self.theme.surface_secondary.as_d2d())?;
-            let side_brush = self.create_brush(self.theme.surface_primary.as_d2d())?;
-            let tool_brush = self.create_brush(self.theme.surface_secondary.as_d2d())?;
-            let status_brush = self.create_brush(self.theme.surface_primary.as_d2d())?;
+            let mut tab_color = self.theme.surface_secondary.as_d2d();
+            let mut side_color = self.theme.surface_primary.as_d2d();
+            let mut tool_color = self.theme.surface_secondary.as_d2d();
+            let mut status_color = self.theme.surface_primary.as_d2d();
+            if shell.accessibility_high_contrast {
+                tab_color = crate::ui::Color::rgb(0.08, 0.08, 0.08).as_d2d();
+                side_color = crate::ui::Color::rgb(0.0, 0.0, 0.0).as_d2d();
+                tool_color = crate::ui::Color::rgb(0.08, 0.08, 0.08).as_d2d();
+                status_color = crate::ui::Color::rgb(0.0, 0.0, 0.0).as_d2d();
+            }
+            let tab_brush = self.create_brush(tab_color)?;
+            let side_brush = self.create_brush(side_color)?;
+            let tool_brush = self.create_brush(tool_color)?;
+            let status_brush = self.create_brush(status_color)?;
 
             if tab_h > 0.0 {
                 self.d2d_context.FillRectangle(&tab_rect, &tab_brush);
@@ -499,7 +527,12 @@ impl D2DRenderer {
                     .FillRectangle(&splitter_rect, &splitter_brush);
             }
 
-            let text_brush = self.create_brush(self.theme.text_primary.as_d2d())?;
+            let text_color = if shell.accessibility_high_contrast {
+                crate::ui::Color::rgb(1.0, 1.0, 1.0).as_d2d()
+            } else {
+                self.theme.text_primary.as_d2d()
+            };
+            let text_brush = self.create_brush(text_color)?;
             let text_format = self.create_text_format()?;
             if sidebar_w > 0.0 {
                 let files = "Files".encode_utf16().collect::<Vec<u16>>();
@@ -577,7 +610,7 @@ impl D2DRenderer {
                 let palette_w = 600.0_f32.min((width - 24.0).max(320.0));
                 let palette_h = 400.0_f32.min((height - 28.0).max(120.0));
                 let palette_x = (width - palette_w) * 0.5;
-                let palette_y = 20.0;
+                let palette_y = 20.0 + shell.command_palette_offset_y;
                 let palette_rect = D2D_RECT_F {
                     left: palette_x,
                     top: palette_y,
@@ -586,12 +619,14 @@ impl D2DRenderer {
                 };
 
                 let mut overlay = self.theme.surface_primary.as_d2d();
-                overlay.a = 0.94;
+                overlay.a = 0.94 * shell.command_palette_opacity.clamp(0.0, 1.0);
                 let overlay_brush = self.create_brush(overlay)?;
                 self.d2d_context
                     .FillRectangle(&palette_rect, &overlay_brush);
 
-                let border_brush = self.create_brush(self.theme.border_default.as_d2d())?;
+                let mut border = self.theme.border_default.as_d2d();
+                border.a *= shell.command_palette_opacity.clamp(0.0, 1.0);
+                let border_brush = self.create_brush(border)?;
                 self.d2d_context.DrawRectangle(
                     &palette_rect,
                     &border_brush,
@@ -1561,14 +1596,20 @@ impl D2DRenderer {
                     let close_brush = self.create_brush(self.theme.text_secondary.as_d2d())?;
                     let mut x = tabs_left;
                     for (idx, title) in shell.tab_titles.iter().enumerate() {
-                        let rect = D2D_RECT_F {
+                        let mut rect = D2D_RECT_F {
                             left: x,
                             top: tabs_top,
                             right: (x + tab_w).min(tabs_right),
                             bottom: tabs_bottom,
                         };
+                        if idx == shell.active_tab {
+                            rect.left += shell.tab_transition_offset;
+                            rect.right += shell.tab_transition_offset;
+                        }
                         let brush = if idx == shell.active_tab {
-                            self.create_brush(self.theme.surface_hover.as_d2d())?
+                            let mut active = self.theme.surface_hover.as_d2d();
+                            active.a *= shell.tab_transition_progress.clamp(0.0, 1.0).max(0.65);
+                            self.create_brush(active)?
                         } else {
                             self.create_brush(self.theme.surface_secondary.as_d2d())?
                         };
@@ -1642,6 +1683,92 @@ impl D2DRenderer {
                     if x > width - 70.0 {
                         break;
                     }
+                }
+            }
+
+            if shell.toolbar_dropdown_open && shell.toolbar_dropdown_opacity > 0.01 {
+                let panel_w = 240.0 * shell.toolbar_dropdown_scale.clamp(0.9, 1.2);
+                let panel_h = 180.0 * shell.toolbar_dropdown_scale.clamp(0.9, 1.2);
+                let panel_x = sidebar_w + 20.0;
+                let panel_y = tab_h + toolbar_h + 8.0;
+                let panel_rect = D2D_RECT_F {
+                    left: panel_x,
+                    top: panel_y,
+                    right: panel_x + panel_w,
+                    bottom: panel_y + panel_h,
+                };
+                let mut panel_color = self.theme.surface_primary.as_d2d();
+                panel_color.a = 0.95 * shell.toolbar_dropdown_opacity.clamp(0.0, 1.0);
+                let panel_bg = self.create_brush(panel_color)?;
+                let mut panel_border = self.theme.border_default.as_d2d();
+                panel_border.a *= shell.toolbar_dropdown_opacity.clamp(0.0, 1.0);
+                let panel_border_brush = self.create_brush(panel_border)?;
+                self.d2d_context.FillRectangle(&panel_rect, &panel_bg);
+                self.d2d_context.DrawRectangle(
+                    &panel_rect,
+                    &panel_border_brush,
+                    1.0,
+                    None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                );
+            }
+
+            if !shell.toast_entries.is_empty() {
+                for (idx, entry) in shell.toast_entries.iter().enumerate().take(4) {
+                    let width_toast = 320.0;
+                    let height_toast = 64.0;
+                    let right = width - 14.0 + entry.slide_offset;
+                    let left = right - width_toast;
+                    let bottom = (height - status_h - 14.0) - (idx as f32 * 74.0);
+                    let top = bottom - height_toast;
+                    let rect = D2D_RECT_F {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    };
+
+                    let mut bg = self.theme.surface_primary.as_d2d();
+                    bg.a = 0.94 * entry.opacity.clamp(0.0, 1.0);
+                    let mut border = self.theme.border_default.as_d2d();
+                    border.a *= entry.opacity.clamp(0.0, 1.0);
+                    let bg_brush = self.create_brush(bg)?;
+                    let border_brush = self.create_brush(border)?;
+                    self.d2d_context.FillRectangle(&rect, &bg_brush);
+                    self.d2d_context.DrawRectangle(
+                        &rect,
+                        &border_brush,
+                        1.0,
+                        None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                    );
+
+                    let title = entry.title.encode_utf16().collect::<Vec<u16>>();
+                    self.d2d_context.DrawText(
+                        &title,
+                        &text_format,
+                        &D2D_RECT_F {
+                            left: rect.left + 10.0,
+                            top: rect.top + 8.0,
+                            right: rect.right - 10.0,
+                            bottom: rect.top + 28.0,
+                        },
+                        &text_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    let body = entry.body.encode_utf16().collect::<Vec<u16>>();
+                    self.d2d_context.DrawText(
+                        &body,
+                        &text_format,
+                        &D2D_RECT_F {
+                            left: rect.left + 10.0,
+                            top: rect.top + 28.0,
+                            right: rect.right - 10.0,
+                            bottom: rect.bottom - 8.0,
+                        },
+                        &text_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
                 }
             }
 

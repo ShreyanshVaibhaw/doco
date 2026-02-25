@@ -11,6 +11,7 @@ use crate::{
 const TOAST_WIDTH: f32 = 320.0;
 const TOAST_HEIGHT: f32 = 64.0;
 const TOAST_GAP: f32 = 10.0;
+const TOAST_FADE_OUT_S: f32 = 0.35;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastLevel {
@@ -108,6 +109,16 @@ impl Toast {
                         entry.slide_anim = None;
                     }
                 }
+
+                let elapsed_s = entry.created_at.elapsed().as_secs_f32();
+                let ttl_s = entry.ttl.as_secs_f32().max(0.001);
+                let fade_start_s = (ttl_s - TOAST_FADE_OUT_S).max(0.0);
+                if elapsed_s >= fade_start_s {
+                    let fade_t = ((elapsed_s - fade_start_s) / TOAST_FADE_OUT_S).clamp(0.0, 1.0);
+                    let target_opacity = (1.0 - fade_t).clamp(0.0, 1.0);
+                    entry.opacity = entry.opacity.min(target_opacity);
+                    entry.slide += fade_t * 6.0;
+                }
             } else {
                 entry.opacity = 1.0;
                 entry.slide = 0.0;
@@ -182,4 +193,36 @@ fn contains(rect: Rect, point: Point) -> bool {
         && point.x <= rect.x + rect.width
         && point.y >= rect.y
         && point.y <= rect.y + rect.height
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{Toast, ToastLevel};
+
+    #[test]
+    fn toast_fades_out_near_ttl_end() {
+        let mut toast = Toast::default();
+        let id = toast.push(ToastLevel::Info, "Info", "Body");
+        {
+            let entry = toast.entries.iter_mut().find(|item| item.id == id).expect("entry missing");
+            entry.created_at = Instant::now() - Duration::from_millis(3900);
+        }
+
+        toast.tick(0.016);
+        let entry = toast.entries.iter().find(|item| item.id == id).expect("entry missing");
+        assert!(entry.opacity < 0.8);
+    }
+
+    #[test]
+    fn reduce_motion_keeps_toast_static() {
+        let mut toast = Toast::default();
+        toast.reduce_motion = true;
+        let id = toast.push(ToastLevel::Success, "Done", "Saved");
+        toast.tick(0.016);
+        let entry = toast.entries.iter().find(|item| item.id == id).expect("entry missing");
+        assert_eq!(entry.opacity, 1.0);
+        assert_eq!(entry.slide, 0.0);
+    }
 }

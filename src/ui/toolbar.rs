@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
 
 use crate::{
+    render::animation::{Animation, Easing},
     theme::Theme,
     ui::{Color, InputEvent, Point, Rect, UIComponent},
 };
@@ -13,6 +14,7 @@ const BUTTON_HEIGHT: f32 = 32.0;
 const SPLIT_DROPDOWN_WIDTH: f32 = 14.0;
 const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
 const QUICK_ANIMATION: Duration = Duration::from_millis(100);
+const DROPDOWN_ANIMATION_S: f32 = 0.10;
 const DEFAULT_OVERFLOW_PANEL_WIDTH: f32 = 220.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,12 +329,16 @@ impl Default for ListPickerState {
 pub struct ToolbarDropdownState {
     pub open: Option<ToolbarDropdownKind>,
     pub anchor: Option<Rect>,
+    pub opacity: f32,
+    pub scale: f32,
     pub panel_width: f32,
     pub font_picker: FontPickerState,
     pub size_picker: SizePickerState,
     pub color_picker: ColorPickerState,
     pub heading_picker: HeadingPickerState,
     pub list_picker: ListPickerState,
+    fade_anim: Option<Animation>,
+    scale_anim: Option<Animation>,
 }
 
 impl Default for ToolbarDropdownState {
@@ -340,25 +346,77 @@ impl Default for ToolbarDropdownState {
         Self {
             open: None,
             anchor: None,
+            opacity: 0.0,
+            scale: 0.95,
             panel_width: DEFAULT_OVERFLOW_PANEL_WIDTH,
             font_picker: FontPickerState::default(),
             size_picker: SizePickerState::default(),
             color_picker: ColorPickerState::default(),
             heading_picker: HeadingPickerState::default(),
             list_picker: ListPickerState::default(),
+            fade_anim: None,
+            scale_anim: None,
         }
     }
 }
 
 impl ToolbarDropdownState {
-    pub fn open(&mut self, kind: ToolbarDropdownKind, anchor: Rect) {
+    pub fn open(&mut self, kind: ToolbarDropdownKind, anchor: Rect, reduce_motion: bool) {
         self.open = Some(kind);
         self.anchor = Some(anchor);
+        if reduce_motion {
+            self.opacity = 1.0;
+            self.scale = 1.0;
+            self.fade_anim = None;
+            self.scale_anim = None;
+        } else {
+            self.opacity = 0.0;
+            self.scale = 0.95;
+            self.fade_anim = Some(Animation::new(0.0, 1.0, DROPDOWN_ANIMATION_S, Easing::EaseOutCubic));
+            self.scale_anim = Some(Animation::new(0.95, 1.0, DROPDOWN_ANIMATION_S, Easing::EaseOutCubic));
+        }
     }
 
     pub fn close(&mut self) {
         self.open = None;
         self.anchor = None;
+        self.opacity = 0.0;
+        self.scale = 0.95;
+        self.fade_anim = None;
+        self.scale_anim = None;
+    }
+
+    pub fn tick(&mut self, dt_s: f32, reduce_motion: bool) {
+        if reduce_motion {
+            if self.open.is_some() {
+                self.opacity = 1.0;
+                self.scale = 1.0;
+            } else {
+                self.opacity = 0.0;
+                self.scale = 0.95;
+            }
+            self.fade_anim = None;
+            self.scale_anim = None;
+            return;
+        }
+
+        if let Some(anim) = &mut self.fade_anim {
+            if anim.update(dt_s) {
+                self.opacity = anim.current_value.clamp(0.0, 1.0);
+            } else {
+                self.opacity = anim.end_value.clamp(0.0, 1.0);
+                self.fade_anim = None;
+            }
+        }
+
+        if let Some(anim) = &mut self.scale_anim {
+            if anim.update(dt_s) {
+                self.scale = anim.current_value;
+            } else {
+                self.scale = anim.end_value;
+                self.scale_anim = None;
+            }
+        }
     }
 }
 
@@ -378,6 +436,7 @@ pub enum ToolbarIntent {
 pub struct Toolbar {
     bounds: Rect,
     visible: bool,
+    reduce_motion: bool,
     all_buttons: Vec<ToolbarButton>,
     pub buttons: Vec<ToolbarButton>,
     pub overflow: Vec<ToolbarButton>,
@@ -405,6 +464,7 @@ impl Toolbar {
         let mut toolbar = Self {
             bounds: Rect::default(),
             visible: true,
+            reduce_motion: false,
             all_buttons: all_buttons.clone(),
             buttons: all_buttons,
             overflow: Vec::new(),
@@ -608,7 +668,7 @@ impl Toolbar {
         match intent {
             ToolbarIntent::OpenDropdown(kind) => {
                 if let Some(anchor) = self.button_rect(index) {
-                    self.dropdown.open(kind, anchor);
+                    self.dropdown.open(kind, anchor, self.reduce_motion);
                 }
             }
             ToolbarIntent::Action(_) => {}
@@ -616,6 +676,17 @@ impl Toolbar {
 
         self.pending_intent = Some(intent);
         Some(intent)
+    }
+
+    pub fn set_reduce_motion(&mut self, reduce_motion: bool) {
+        self.reduce_motion = reduce_motion;
+        if reduce_motion {
+            self.dropdown.tick(0.0, true);
+        }
+    }
+
+    pub fn tick(&mut self, dt_s: f32) {
+        self.dropdown.tick(dt_s, self.reduce_motion);
     }
 
     fn sync_button_states_from_format(&mut self) {
@@ -1073,6 +1144,32 @@ mod tests {
         toolbar.hover_started = Some(Instant::now() - Duration::from_millis(600));
         toolbar.begin_hover(Some(idx));
         assert!(toolbar.show_tooltip);
+    }
+
+    #[test]
+    fn dropdown_animates_on_open() {
+        let mut toolbar = Toolbar::new();
+        toolbar.layout(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1400.0,
+                height: 44.0,
+            },
+            96.0,
+        );
+
+        let idx = find_button_index(&toolbar, "font").expect("font button missing");
+        let rect = toolbar.button_rect(idx).expect("font rect missing");
+        let point = Point {
+            x: rect.x + rect.width * 0.5,
+            y: rect.y + rect.height * 0.5,
+        };
+        let _ = toolbar.invoke_with_point(point);
+        assert!(toolbar.dropdown.opacity <= 0.05);
+        toolbar.tick(0.2);
+        assert!(toolbar.dropdown.opacity >= 0.95);
+        assert!(toolbar.dropdown.scale >= 0.99);
     }
 
     #[test]

@@ -152,6 +152,7 @@ pub struct Sidebar {
     target_width: f32,
     collapse_anim: Option<Animation>,
     pub is_collapsed: bool,
+    pub reduce_motion: bool,
     pub resizing: bool,
     pub file_root: Option<PathBuf>,
     pub file_tree: Vec<FileNode>,
@@ -187,6 +188,7 @@ impl Sidebar {
             target_width: SIDEBAR_DEFAULT_WIDTH,
             collapse_anim: None,
             is_collapsed: false,
+            reduce_motion: false,
             resizing: false,
             file_root: None,
             file_tree: Vec::new(),
@@ -246,12 +248,17 @@ impl Sidebar {
         self.is_collapsed = !self.is_collapsed;
         let from = self.width;
         self.target_width = if self.is_collapsed { 0.0 } else { SIDEBAR_DEFAULT_WIDTH };
-        self.collapse_anim = Some(Animation::new(
-            from,
-            self.target_width,
-            COLLAPSE_DURATION_S,
-            Easing::Spring,
-        ));
+        if self.reduce_motion {
+            self.width = self.target_width;
+            self.collapse_anim = None;
+        } else {
+            self.collapse_anim = Some(Animation::new(
+                from,
+                self.target_width,
+                COLLAPSE_DURATION_S,
+                Easing::Spring,
+            ));
+        }
     }
 
     pub fn set_width(&mut self, width: f32) {
@@ -266,7 +273,7 @@ impl Sidebar {
 
     pub fn tick(&mut self, dt_s: f32) {
         if let Some(anim) = &mut self.collapse_anim {
-            if anim.update(dt_s) {
+            if anim.update_respecting_motion_pref(dt_s, self.reduce_motion) {
                 self.width = anim.current_value;
             } else {
                 self.width = anim.end_value;

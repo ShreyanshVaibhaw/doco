@@ -39,6 +39,7 @@ pub struct ScrollbarState {
     pub visible: bool,
     pub alpha: f32,
     pub thickness: f32,
+    pub idle_seconds: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -64,6 +65,7 @@ pub struct CanvasState {
     pub scroll_anim_x: Option<Animation>,
     pub scroll_anim_y: Option<Animation>,
     pub show_margin_guides: bool,
+    pub reduce_motion: bool,
     pub scrollbar: ScrollbarState,
     pub cursor: CursorVisualState,
     pub page_cache: HashMap<usize, CachedPage>,
@@ -85,10 +87,12 @@ impl Default for CanvasState {
             scroll_anim_x: None,
             scroll_anim_y: None,
             show_margin_guides: false,
+            reduce_motion: false,
             scrollbar: ScrollbarState {
                 visible: false,
                 alpha: 0.0,
                 thickness: 6.0,
+                idle_seconds: 0.0,
             },
             cursor: CursorVisualState {
                 blink_timer_s: 0.0,
@@ -139,7 +143,17 @@ impl CanvasState {
         }
 
         self.zoom_target = clamped;
-        self.zoom_anim = Some(Animation::new(self.zoom, self.zoom_target, 0.15, Easing::EaseOutCubic));
+        if self.reduce_motion {
+            self.zoom = self.zoom_target;
+            self.zoom_anim = None;
+        } else {
+            self.zoom_anim = Some(Animation::new(
+                self.zoom,
+                self.zoom_target,
+                0.15,
+                Easing::EaseOutCubic,
+            ));
+        }
         self.page_cache.clear();
         self.mark_dirty_full();
     }
@@ -151,8 +165,20 @@ impl CanvasState {
         } else {
             let impulse = -delta * 3.0;
             self.scroll.velocity_y += impulse;
-            self.scroll_anim_y = Some(Animation::new(self.scroll.y, self.scroll.y + impulse * 0.35, 0.20, Easing::Spring));
+            if self.reduce_motion {
+                self.scroll.y += impulse * 0.35;
+                self.scroll_anim_y = None;
+            } else {
+                self.scroll_anim_y = Some(Animation::new(
+                    self.scroll.y,
+                    self.scroll.y + impulse * 0.35,
+                    0.20,
+                    Easing::Spring,
+                ));
+            }
             self.scrollbar.visible = true;
+            self.scrollbar.alpha = self.scrollbar.alpha.max(0.65);
+            self.scrollbar.idle_seconds = 0.0;
             self.mark_dirty_full();
         }
     }
@@ -160,8 +186,20 @@ impl CanvasState {
     pub fn handle_horizontal_wheel(&mut self, delta: f32) {
         let impulse = -delta * 3.0;
         self.scroll.velocity_x += impulse;
-        self.scroll_anim_x = Some(Animation::new(self.scroll.x, self.scroll.x + impulse * 0.35, 0.20, Easing::Spring));
+        if self.reduce_motion {
+            self.scroll.x += impulse * 0.35;
+            self.scroll_anim_x = None;
+        } else {
+            self.scroll_anim_x = Some(Animation::new(
+                self.scroll.x,
+                self.scroll.x + impulse * 0.35,
+                0.20,
+                Easing::Spring,
+            ));
+        }
         self.scrollbar.visible = true;
+        self.scrollbar.alpha = self.scrollbar.alpha.max(0.65);
+        self.scrollbar.idle_seconds = 0.0;
         self.mark_dirty_full();
     }
 
@@ -202,7 +240,7 @@ impl CanvasState {
         let mut animating = false;
 
         if let Some(anim) = &mut self.zoom_anim {
-            if anim.update(dt_s) {
+            if anim.update_respecting_motion_pref(dt_s, self.reduce_motion) {
                 self.zoom = anim.current_value;
                 animating = true;
                 self.mark_dirty_full();
@@ -214,9 +252,10 @@ impl CanvasState {
         }
 
         if let Some(anim) = &mut self.scroll_anim_x {
-            if anim.update(dt_s) {
+            if anim.update_respecting_motion_pref(dt_s, self.reduce_motion) {
                 self.scroll.x = anim.current_value;
                 animating = true;
+                self.scrollbar.idle_seconds = 0.0;
                 self.mark_dirty_full();
             } else {
                 self.scroll.x = anim.end_value;
@@ -226,9 +265,10 @@ impl CanvasState {
         }
 
         if let Some(anim) = &mut self.scroll_anim_y {
-            if anim.update(dt_s) {
+            if anim.update_respecting_motion_pref(dt_s, self.reduce_motion) {
                 self.scroll.y = anim.current_value;
                 animating = true;
+                self.scrollbar.idle_seconds = 0.0;
                 self.mark_dirty_full();
             } else {
                 self.scroll.y = anim.end_value;
@@ -246,17 +286,35 @@ impl CanvasState {
         }
 
         if self.scrollbar.visible {
-            self.scrollbar.alpha = (self.scrollbar.alpha + dt_s * 4.0).clamp(0.0, 1.0);
-            if self.scroll_anim_x.is_none() && self.scroll_anim_y.is_none() {
-                self.scrollbar.alpha = (self.scrollbar.alpha - dt_s * 2.0).clamp(0.0, 1.0);
-                if self.scrollbar.alpha <= 0.01 {
-                    self.scrollbar.visible = false;
+            if self.scroll_anim_x.is_some() || self.scroll_anim_y.is_some() {
+                self.scrollbar.idle_seconds = 0.0;
+                self.scrollbar.alpha = (self.scrollbar.alpha + dt_s * 4.0).clamp(0.0, 1.0);
+            } else {
+                self.scrollbar.idle_seconds += dt_s;
+                if self.scrollbar.idle_seconds >= 1.5 {
+                    self.scrollbar.alpha = (self.scrollbar.alpha - dt_s * 2.0).clamp(0.0, 1.0);
+                    if self.scrollbar.alpha <= 0.01 {
+                        self.scrollbar.visible = false;
+                        self.scrollbar.idle_seconds = 0.0;
+                    }
+                } else {
+                    self.scrollbar.alpha = (self.scrollbar.alpha + dt_s * 4.0).clamp(0.0, 1.0);
                 }
-                self.mark_dirty_full();
             }
+            self.mark_dirty_full();
         }
 
         animating
+    }
+
+    pub fn set_reduce_motion(&mut self, reduce_motion: bool) {
+        self.reduce_motion = reduce_motion;
+        if reduce_motion {
+            self.zoom_anim = None;
+            self.scroll_anim_x = None;
+            self.scroll_anim_y = None;
+            self.zoom = self.zoom_target;
+        }
     }
 
     pub fn page_rects(&self, document: &DocumentModel) -> Vec<Rect> {
@@ -350,5 +408,32 @@ fn page_dimensions_points(document: &DocumentModel) -> (f32, f32) {
             width_points,
             height_points,
         } => (width_points, height_points),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CanvasState, Point};
+
+    #[test]
+    fn scrollbar_waits_before_fading_out() {
+        let mut canvas = CanvasState::default();
+        canvas.handle_mouse_wheel(1.0, false, Point { x: 40.0, y: 40.0 });
+        canvas.scroll_anim_y = None;
+        canvas.scrollbar.alpha = 1.0;
+        let _ = canvas.update(1.0);
+        assert!(canvas.scrollbar.visible);
+        assert!(canvas.scrollbar.alpha > 0.9);
+        let _ = canvas.update(0.7);
+        assert!(canvas.scrollbar.alpha < 1.0);
+    }
+
+    #[test]
+    fn reduce_motion_disables_zoom_animation() {
+        let mut canvas = CanvasState::default();
+        canvas.set_reduce_motion(true);
+        canvas.set_zoom(1.5, None);
+        assert!(canvas.zoom_anim.is_none());
+        assert_eq!(canvas.zoom, 1.5);
     }
 }

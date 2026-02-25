@@ -9,16 +9,23 @@ use windows::{
         Foundation::HWND,
         Graphics::Gdi::DeleteDC,
         UI::{
+            Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
             Controls::Dialogs::{
                 GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST,
                 OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW, PD_NOSELECTION, PD_PAGENUMS,
                 PD_RETURNDC, PD_USEDEVMODECOPIESANDCOLLATE, PRINTDLGW, PrintDlgW,
             },
             Shell::{DragFinish, DragQueryFileW, HDROP, SHARD_PATHW, SHAddToRecentDocs},
+            WindowsAndMessaging::{
+                SPI_GETCLIENTAREAANIMATION, SPI_GETHIGHCONTRAST, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+                SystemParametersInfoW,
+            },
         },
     },
     core::w,
 };
+
+use crate::ui::AccessibilityPreferences;
 
 pub const SUPPORTED_DOCUMENT_EXTENSIONS: &[&str] = &["docx", "pdf", "txt", "md", "rtf"];
 pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
@@ -230,6 +237,44 @@ pub fn send_toast_notification(title: &str, body: &str) {
     eprintln!("[toast] {} - {}", title, body);
 }
 
+pub fn query_accessibility_preferences() -> AccessibilityPreferences {
+    let mut preferences = AccessibilityPreferences::default();
+
+    let mut high_contrast = HIGHCONTRASTW {
+        cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    let high_contrast_ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            high_contrast.cbSize,
+            Some((&mut high_contrast as *mut HIGHCONTRASTW).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+    };
+    if high_contrast_ok {
+        preferences.high_contrast =
+            (high_contrast.dwFlags & HCF_HIGHCONTRASTON) == HCF_HIGHCONTRASTON;
+    }
+
+    let mut client_area_animations: i32 = 1;
+    let animation_ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&mut client_area_animations as *mut i32).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+    };
+    if animation_ok {
+        preferences.reduce_motion = client_area_animations == 0;
+    }
+
+    preferences
+}
+
 fn normalize_page_range(from: u16, to: u16) -> Option<(u32, u32)> {
     if from == 0 && to == 0 {
         return None;
@@ -343,6 +388,7 @@ mod tests {
         file_association_registry_commands,
         is_image_path,
         normalize_page_range,
+        query_accessibility_preferences,
     };
 
     #[test]
@@ -366,5 +412,12 @@ mod tests {
         assert_eq!(normalize_page_range(0, 0), None);
         assert_eq!(normalize_page_range(3, 1), Some((3, 3)));
         assert_eq!(normalize_page_range(2, 6), Some((2, 6)));
+    }
+
+    #[test]
+    fn accessibility_query_returns_a_valid_struct() {
+        let prefs = query_accessibility_preferences();
+        assert!(matches!(prefs.high_contrast, true | false));
+        assert!(matches!(prefs.reduce_motion, true | false));
     }
 }
