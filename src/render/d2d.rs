@@ -68,6 +68,20 @@ pub struct ShellRenderState {
     pub command_palette_query: String,
     pub command_palette_results: Vec<String>,
     pub command_palette_selected: usize,
+    pub find_visible: bool,
+    pub replace_visible: bool,
+    pub find_query: String,
+    pub replace_query: String,
+    pub find_result_count: String,
+    pub find_case_sensitive: bool,
+    pub find_whole_word: bool,
+    pub find_regex: bool,
+    pub find_preview: String,
+    pub find_current: usize,
+    pub find_total: usize,
+    pub find_capture_groups: Vec<String>,
+    pub goto_visible: bool,
+    pub goto_input: String,
     pub status_left: String,
     pub status_right: String,
     pub canvas_background: BackgroundSettings,
@@ -543,6 +557,233 @@ impl D2DRenderer {
                 }
             }
 
+            if shell.find_visible && !shell.command_palette_open {
+                let panel_w = 460.0_f32.min((canvas_rect.right - canvas_rect.left - 20.0).max(300.0));
+                let panel_h = if shell.replace_visible { 188.0 } else { 136.0 };
+                let panel_x = (canvas_rect.right - panel_w - 10.0).max(canvas_rect.left + 8.0);
+                let panel_y = canvas_rect.top + 10.0;
+                let panel_rect = D2D_RECT_F {
+                    left: panel_x,
+                    top: panel_y,
+                    right: panel_x + panel_w,
+                    bottom: panel_y + panel_h,
+                };
+
+                let panel_bg = self.create_brush(self.theme.surface_primary.as_d2d())?;
+                let panel_border = self.create_brush(self.theme.border_default.as_d2d())?;
+                self.d2d_context.FillRectangle(&panel_rect, &panel_bg);
+                self.d2d_context.DrawRectangle(
+                    &panel_rect,
+                    &panel_border,
+                    1.0,
+                    None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                );
+
+                let title = if shell.replace_visible {
+                    "Find & Replace"
+                } else {
+                    "Find"
+                };
+                let title_utf16 = title.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &title_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: panel_x + 10.0,
+                        top: panel_y + 6.0,
+                        right: panel_x + panel_w - 10.0,
+                        bottom: panel_y + 24.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let find_line = format!("Find: {}", shell.find_query);
+                let find_utf16 = find_line.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &find_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: panel_x + 10.0,
+                        top: panel_y + 28.0,
+                        right: panel_x + panel_w - 10.0,
+                        bottom: panel_y + 48.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let options = format!(
+                    "[{}] Case  [{}] Word  [{}] Regex   [Shift+Enter] Prev  [Enter] Next  [Esc] Close",
+                    if shell.find_case_sensitive { "x" } else { " " },
+                    if shell.find_whole_word { "x" } else { " " },
+                    if shell.find_regex { "x" } else { " " }
+                );
+                let options_utf16 = options.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &options_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: panel_x + 10.0,
+                        top: panel_y + 48.0,
+                        right: panel_x + panel_w - 10.0,
+                        bottom: panel_y + 68.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let count_line = format!(
+                    "{} ({}/{})",
+                    shell.find_result_count,
+                    shell.find_current,
+                    shell.find_total
+                );
+                let count_utf16 = count_line.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &count_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: panel_x + 10.0,
+                        top: panel_y + 68.0,
+                        right: panel_x + panel_w - 10.0,
+                        bottom: panel_y + 88.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                if shell.replace_visible {
+                    let replace_line = format!("Replace: {}", shell.replace_query);
+                    let replace_utf16 = replace_line.encode_utf16().collect::<Vec<u16>>();
+                    self.d2d_context.DrawText(
+                        &replace_utf16,
+                        &text_format,
+                        &D2D_RECT_F {
+                            left: panel_x + 10.0,
+                            top: panel_y + 88.0,
+                            right: panel_x + panel_w - 10.0,
+                            bottom: panel_y + 108.0,
+                        },
+                        &text_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+
+                    let actions =
+                        "[Ctrl+Enter] Replace Current   [Ctrl+Shift+Enter] Replace All".encode_utf16().collect::<Vec<u16>>();
+                    self.d2d_context.DrawText(
+                        &actions,
+                        &text_format,
+                        &D2D_RECT_F {
+                            left: panel_x + 10.0,
+                            top: panel_y + 108.0,
+                            right: panel_x + panel_w - 10.0,
+                            bottom: panel_y + 128.0,
+                        },
+                        &text_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+
+                let preview_top = if shell.replace_visible {
+                    panel_y + 130.0
+                } else {
+                    panel_y + 90.0
+                };
+                let preview_line = format!("Preview: {}", shell.find_preview);
+                let preview_utf16 = preview_line.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &preview_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: panel_x + 10.0,
+                        top: preview_top,
+                        right: panel_x + panel_w - 10.0,
+                        bottom: panel_rect.bottom - 8.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                if shell.find_regex && !shell.find_capture_groups.is_empty() {
+                    let mut gy = preview_top + 18.0;
+                    for g in shell.find_capture_groups.iter().take(3) {
+                        let g_utf16 = g.encode_utf16().collect::<Vec<u16>>();
+                        self.d2d_context.DrawText(
+                            &g_utf16,
+                            &text_format,
+                            &D2D_RECT_F {
+                                left: panel_x + 14.0,
+                                top: gy,
+                                right: panel_x + panel_w - 10.0,
+                                bottom: gy + 18.0,
+                            },
+                            &text_brush,
+                            D2D1_DRAW_TEXT_OPTIONS_NONE,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                        gy += 16.0;
+                    }
+                }
+            }
+
+            if shell.goto_visible && !shell.command_palette_open {
+                let dialog_w = 260.0_f32.min((canvas_rect.right - canvas_rect.left - 20.0).max(180.0));
+                let dialog_h = 72.0;
+                let dialog_x = (canvas_rect.right - dialog_w - 10.0).max(canvas_rect.left + 8.0);
+                let dialog_y = canvas_rect.top + 10.0;
+                let dialog = D2D_RECT_F {
+                    left: dialog_x,
+                    top: dialog_y,
+                    right: dialog_x + dialog_w,
+                    bottom: dialog_y + dialog_h,
+                };
+                let dialog_bg = self.create_brush(self.theme.surface_primary.as_d2d())?;
+                let dialog_border = self.create_brush(self.theme.border_default.as_d2d())?;
+                self.d2d_context.FillRectangle(&dialog, &dialog_bg);
+                self.d2d_context.DrawRectangle(
+                    &dialog,
+                    &dialog_border,
+                    1.0,
+                    None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                );
+                let title = "Go To (Ctrl+G)".encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &title,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: dialog.left + 10.0,
+                        top: dialog.top + 8.0,
+                        right: dialog.right - 10.0,
+                        bottom: dialog.top + 28.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                let input = format!("Line/Page: {}", shell.goto_input).encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &input,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: dialog.left + 10.0,
+                        top: dialog.top + 30.0,
+                        right: dialog.right - 10.0,
+                        bottom: dialog.bottom - 10.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+
             let status = shell.status_text.encode_utf16().collect::<Vec<u16>>();
             if status_h > 0.0 {
                 self.d2d_context.DrawText(
@@ -896,6 +1137,49 @@ impl D2DRenderer {
                 bottom: text_rect.top + 22.0,
             };
             self.d2d_context.FillRectangle(&selection_rect, &selection);
+        }
+
+        if shell.find_visible && shell.find_total > 0 {
+            let all_match_brush = self.create_brush(
+                crate::ui::Color::rgba(
+                    self.theme.accent.r,
+                    self.theme.accent.g,
+                    self.theme.accent.b,
+                    0.22,
+                )
+                .as_d2d(),
+            )?;
+            let current_match_brush = self.create_brush(
+                crate::ui::Color::rgba(
+                    self.theme.accent.r,
+                    self.theme.accent.g,
+                    self.theme.accent.b,
+                    0.46,
+                )
+                .as_d2d(),
+            )?;
+
+            let markers = shell.find_total.min(24);
+            if markers > 0 {
+                let marker_w = ((text_rect.right - text_rect.left) / markers as f32).max(6.0);
+                for idx in 0..markers {
+                    let left = text_rect.left + idx as f32 * marker_w;
+                    let rect = D2D_RECT_F {
+                        left,
+                        top: text_rect.top + 26.0,
+                        right: (left + marker_w - 2.0).min(text_rect.right),
+                        bottom: text_rect.top + 34.0,
+                    };
+                    let brush = if shell.find_current > 0 && idx + 1 == shell.find_current.min(markers) {
+                        &current_match_brush
+                    } else {
+                        &all_match_brush
+                    };
+                    unsafe {
+                        self.d2d_context.FillRectangle(&rect, brush);
+                    }
+                }
+            }
         }
 
         let preview = shell

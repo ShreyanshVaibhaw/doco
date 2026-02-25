@@ -49,6 +49,7 @@ use crate::{
         model::{Block, BlockId, DocumentModel},
         txt::TextDocument,
     },
+    editor::search::{FindReplaceState, replace_all, replace_current, replacement_preview},
     render::canvas::PageLayoutMode,
     render::d2d::{D2DRenderer, ShellRenderState},
     settings::schema::Settings,
@@ -59,7 +60,7 @@ use crate::{
         Point as UiPoint,
         Rect as UiRect,
         UIComponent,
-        sidebar::{Sidebar, SidebarIntent, SidebarPanel},
+        sidebar::{SearchResultItem, Sidebar, SidebarIntent, SidebarPanel},
         statusbar::{StatusAction, StatusBar, StatusBarInfo},
         tabs::{TabKind, TabsBar},
         toolbar::{Toolbar, ToolbarAction},
@@ -81,6 +82,12 @@ pub struct AppWindow {
     hwnd: HWND,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindFieldFocus {
+    Query,
+    Replacement,
+}
+
 struct WindowState {
     renderer: Option<D2DRenderer>,
     dpi: f32,
@@ -95,6 +102,10 @@ struct WindowState {
     tabs: TabsBar,
     sidebar: Sidebar,
     command_palette: CommandPalette,
+    find_replace: FindReplaceState,
+    find_focus: FindFieldFocus,
+    goto_visible: bool,
+    goto_input: String,
     toolbar: Toolbar,
     statusbar: StatusBar,
     last_ui_tick: Instant,
@@ -163,6 +174,10 @@ impl AppWindow {
             tabs: TabsBar::default(),
             sidebar: Sidebar::default(),
             command_palette: CommandPalette::default(),
+            find_replace: FindReplaceState::default(),
+            find_focus: FindFieldFocus::Query,
+            goto_visible: false,
+            goto_input: String::new(),
             toolbar: Toolbar::default(),
             statusbar: StatusBar::default(),
             last_ui_tick: Instant::now(),
@@ -374,6 +389,194 @@ fn apply_pending_sidebar_intents(state: &mut WindowState) -> bool {
         }
     }
     changed
+}
+
+fn collect_visible_block_ids_for_search(tab: &mut crate::ui::tabs::TabState) -> Vec<BlockId> {
+    let mut visible_ids = Vec::new();
+    let visible_pages = tab.canvas.cull_and_cache_visible_pages(&tab.document);
+    for page_index in visible_pages {
+        if let Some(page) = tab.document.pages.get(page_index) {
+            visible_ids.extend(page.block_ids.iter().copied());
+        }
+    }
+
+    if visible_ids.is_empty() {
+        visible_ids.push(tab.cursor.primary.block_id);
+    }
+    visible_ids.sort_by_key(|id| id.0);
+    visible_ids.dedup();
+    visible_ids
+}
+
+fn sync_sidebar_search_results(state: &mut WindowState) {
+    let items = state
+        .find_replace
+        .results
+        .iter()
+        .take(500)
+        .map(|m| SearchResultItem {
+            block_id: m.block_id,
+            line_or_page: m.line_or_page,
+            snippet: m.snippet.clone(),
+            start: m.start,
+            end: m.end,
+        })
+        .collect::<Vec<_>>();
+    state
+        .sidebar
+        .set_search_results(state.find_replace.query.clone(), items);
+}
+
+fn refresh_find_results(state: &mut WindowState) -> bool {
+    let mut changed = false;
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        let visible_ids = collect_visible_block_ids_for_search(tab);
+        let previous_count = state.find_replace.results.len();
+        let previous_index = state.find_replace.current_index;
+        let _ = state
+            .find_replace
+            .refresh_results_with_visible(&tab.document, &visible_ids);
+        changed = previous_count != state.find_replace.results.len()
+            || previous_index != state.find_replace.current_index;
+    }
+
+    sync_sidebar_search_results(state);
+    if state.find_replace.find_visible && !state.find_replace.query.is_empty() {
+        state.sidebar.set_active_panel(SidebarPanel::SearchResults);
+    }
+    changed
+}
+
+fn process_find_background_search(state: &mut WindowState, budget_blocks: usize) -> bool {
+    let changed = state.find_replace.process_background_search(budget_blocks);
+    if changed || !state.find_replace.has_pending_background_search() {
+        sync_sidebar_search_results(state);
+    }
+    changed
+}
+
+fn jump_to_search_match(state: &mut WindowState, search_match: &crate::editor::search::SearchMatch) {
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        tab.cursor.primary.block_id = search_match.block_id;
+        tab.cursor.primary.offset = search_match.start;
+        state
+            .sidebar
+            .set_current_outline_block(Some(search_match.block_id));
+    }
+}
+
+fn navigate_find_result(state: &mut WindowState, backwards: bool) -> bool {
+    let found = if backwards {
+        state.find_replace.previous().cloned()
+    } else {
+        state.find_replace.next().cloned()
+    };
+    if let Some(m) = found {
+        jump_to_search_match(state, &m);
+        state.app_state.status_text = format!(
+            "Match {}/{}",
+            state.find_replace.current_index + 1,
+            state.find_replace.results.len()
+        );
+        return true;
+    }
+    false
+}
+
+fn replace_current_match(state: &mut WindowState) -> usize {
+    let mut count = 0;
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        count = replace_current(&mut tab.document, &mut state.find_replace);
+    }
+    if count > 0 {
+        sync_sidebar_search_results(state);
+    }
+    count
+}
+
+fn replace_all_matches(state: &mut WindowState) -> usize {
+    let mut count = 0;
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        count = replace_all(&mut tab.document, &mut state.find_replace);
+    }
+    if count > 0 {
+        sync_sidebar_search_results(state);
+    }
+    count
+}
+
+fn remove_last_char(text: &mut String) {
+    let _ = text.pop();
+}
+
+fn collect_navigable_block_ids(doc: &DocumentModel, out: &mut Vec<BlockId>) {
+    fn walk(block: &Block, out: &mut Vec<BlockId>) {
+        match block {
+            Block::Paragraph(p) => out.push(p.id),
+            Block::Heading(h) => out.push(h.id),
+            Block::CodeBlock(c) => out.push(c.id),
+            Block::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        for nested in &cell.blocks {
+                            walk(nested, out);
+                        }
+                    }
+                }
+            }
+            Block::List(list) => {
+                for item in &list.items {
+                    for nested in &item.content {
+                        walk(nested, out);
+                    }
+                    for child in &item.children {
+                        for nested in &child.content {
+                            walk(nested, out);
+                        }
+                    }
+                }
+            }
+            Block::BlockQuote(q) => {
+                for nested in &q.blocks {
+                    walk(nested, out);
+                }
+            }
+            Block::Image(_) | Block::PageBreak | Block::HorizontalRule => {}
+        }
+    }
+
+    for block in &doc.content {
+        walk(block, out);
+    }
+}
+
+fn jump_to_line_or_page(state: &mut WindowState, one_based: usize) -> bool {
+    if one_based == 0 {
+        return false;
+    }
+    let Some(tab) = state.tabs.active_tab_mut() else {
+        return false;
+    };
+
+    if let Some(page) = tab.document.pages.get(one_based - 1) {
+        if let Some(id) = page.block_ids.first().copied() {
+            tab.cursor.primary.block_id = id;
+            tab.cursor.primary.offset = 0;
+            state.sidebar.set_current_outline_block(Some(id));
+            return true;
+        }
+    }
+
+    let mut ids = Vec::new();
+    collect_navigable_block_ids(&tab.document, &mut ids);
+    if let Some(id) = ids.get(one_based - 1).copied() {
+        tab.cursor.primary.block_id = id;
+        tab.cursor.primary.offset = 0;
+        state.sidebar.set_current_outline_block(Some(id));
+        return true;
+    }
+
+    false
 }
 
 fn block_snippet(document: &DocumentModel, block_id: BlockId) -> String {
@@ -705,6 +908,36 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
     let command_palette_query = state.command_palette.query.clone();
     let command_palette_selected = state.command_palette.selected;
     let command_palette_results = state.command_palette.result_labels(8);
+    let find_visible = state.find_replace.find_visible;
+    let replace_visible = state.find_replace.replace_visible;
+    let find_query = state.find_replace.query.clone();
+    let replace_query = state.find_replace.replacement.clone();
+    let find_result_count = state.find_replace.result_count_text.clone();
+    let find_case_sensitive = state.find_replace.options.case_sensitive;
+    let find_whole_word = state.find_replace.options.whole_word;
+    let find_regex = state.find_replace.options.regex;
+    let find_total = state.find_replace.results.len();
+    let find_current = if find_total == 0 {
+        0
+    } else {
+        state.find_replace.current_index.saturating_add(1)
+    };
+    let find_preview = state
+        .find_replace
+        .current_result()
+        .map(|m| replacement_preview(m, state.find_replace.replacement.as_str()))
+        .unwrap_or_default();
+    let find_capture_groups = state
+        .find_replace
+        .current_result()
+        .map(|m| {
+            m.capture_groups
+                .iter()
+                .enumerate()
+                .map(|(idx, (s, e))| format!("${}: {}-{}", idx + 1, s, e))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     ShellRenderState {
         show_tabs: state.app_state.show_tabs,
@@ -730,6 +963,20 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         command_palette_query,
         command_palette_results,
         command_palette_selected,
+        find_visible,
+        replace_visible,
+        find_query,
+        replace_query,
+        find_result_count,
+        find_case_sensitive,
+        find_whole_word,
+        find_regex,
+        find_preview,
+        find_current,
+        find_total,
+        find_capture_groups,
+        goto_visible: state.goto_visible,
+        goto_input: state.goto_input.clone(),
         status_left: state.statusbar.left_text(),
         status_right: state.statusbar.right_text(),
         canvas_background: from_canvas_preference(&state.app_state.settings.appearance.canvas_background),
@@ -913,6 +1160,17 @@ unsafe extern "system" fn window_proc(
                     needs_next_frame |= tab.canvas.update(dt);
                     tab.canvas.clamp_scroll(&tab.document);
                 }
+                if state.find_replace.should_live_update(now) {
+                    let refreshed = refresh_find_results(state);
+                    needs_next_frame |= refreshed || state.find_replace.has_pending_background_search();
+                }
+                if state.find_replace.has_pending_background_search() {
+                    let chunk_changed = process_find_background_search(state, 256);
+                    needs_next_frame = true;
+                    if chunk_changed {
+                        state.app_state.status_text = state.find_replace.result_count_text.clone();
+                    }
+                }
                 let background = from_canvas_preference(&state.app_state.settings.appearance.canvas_background);
                 if matches!(background.kind, BackgroundKind::AnimatedGradient { .. }) {
                     needs_next_frame = true;
@@ -1000,8 +1258,157 @@ unsafe extern "system" fn window_proc(
                     let mut handled = state.command_palette.handle_input(&event);
                     if vk == 0x0D {
                         handled |= state.command_palette.execute_selected(&mut state.app_state);
+                        if handled && state.app_state.status_text == "Find" {
+                            state.find_replace.open_find();
+                            state.find_focus = FindFieldFocus::Query;
+                            refresh_find_results(state);
+                        } else if handled && state.app_state.status_text == "Replace" {
+                            state.find_replace.open_replace();
+                            state.find_focus = FindFieldFocus::Replacement;
+                            refresh_find_results(state);
+                        }
                     }
                     if handled {
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+                }
+
+                if ctrl_down && !shift_down && vk == 0x46 {
+                    state.find_replace.open_find();
+                    state.find_focus = FindFieldFocus::Query;
+                    refresh_find_results(state);
+                    state.app_state.status_text = "Find".to_string();
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+
+                if ctrl_down && !shift_down && vk == 0x48 {
+                    state.find_replace.open_replace();
+                    state.find_focus = FindFieldFocus::Replacement;
+                    refresh_find_results(state);
+                    state.app_state.status_text = "Replace".to_string();
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+
+                if ctrl_down && !shift_down && vk == 0x47 {
+                    state.goto_visible = true;
+                    state.goto_input.clear();
+                    state.app_state.status_text = "Go to line/page".to_string();
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+
+                if state.goto_visible {
+                    match vk {
+                        0x1B => {
+                            state.goto_visible = false;
+                            state.goto_input.clear();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                        0x08 => {
+                            remove_last_char(&mut state.goto_input);
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                        0x0D => {
+                            let target = state.goto_input.parse::<usize>().ok().unwrap_or(0);
+                            if jump_to_line_or_page(state, target) {
+                                state.app_state.status_text = format!("Jumped to {}", target);
+                            } else {
+                                state.app_state.status_text = "Target not found".to_string();
+                            }
+                            state.goto_visible = false;
+                            state.goto_input.clear();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                        _ => {}
+                    }
+                }
+
+                if vk == 0x72 {
+                    if navigate_find_result(state, shift_down) {
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
+                }
+
+                if state.find_replace.find_visible {
+                    let mut handled_find = false;
+                    match vk {
+                        0x1B => {
+                            state.find_replace.close();
+                            handled_find = true;
+                        }
+                        0x09 => {
+                            state.find_focus = match (state.find_focus, state.find_replace.replace_visible) {
+                                (FindFieldFocus::Query, true) => FindFieldFocus::Replacement,
+                                _ => FindFieldFocus::Query,
+                            };
+                            handled_find = true;
+                        }
+                        0x08 => {
+                            match state.find_focus {
+                                FindFieldFocus::Query => {
+                                    remove_last_char(&mut state.find_replace.query);
+                                    state.find_replace.set_query(state.find_replace.query.clone());
+                                }
+                                FindFieldFocus::Replacement => {
+                                    remove_last_char(&mut state.find_replace.replacement);
+                                }
+                            }
+                            handled_find = true;
+                        }
+                        0x0D => {
+                            if ctrl_down && state.find_replace.replace_visible {
+                                let replaced = if shift_down {
+                                    replace_all_matches(state)
+                                } else {
+                                    replace_current_match(state)
+                                };
+                                state.app_state.status_text = if replaced == 1 {
+                                    "Replaced 1 occurrence".to_string()
+                                } else {
+                                    format!("Replaced {} occurrences", replaced)
+                                };
+                            } else {
+                                let _ = navigate_find_result(state, shift_down);
+                            }
+                            handled_find = true;
+                        }
+                        _ => {}
+                    }
+
+                    if ctrl_down && shift_down && vk == 0x43 {
+                        state.find_replace.options.case_sensitive = !state.find_replace.options.case_sensitive;
+                        state.find_replace.invalidate_cache();
+                        state.find_replace.pending_live_update = true;
+                        state.find_replace.last_input_at =
+                            Instant::now() - std::time::Duration::from_millis(state.find_replace.debounce_ms);
+                        handled_find = true;
+                    }
+                    if ctrl_down && shift_down && vk == 0x57 {
+                        state.find_replace.options.whole_word = !state.find_replace.options.whole_word;
+                        state.find_replace.invalidate_cache();
+                        state.find_replace.pending_live_update = true;
+                        state.find_replace.last_input_at =
+                            Instant::now() - std::time::Duration::from_millis(state.find_replace.debounce_ms);
+                        handled_find = true;
+                    }
+                    if ctrl_down && shift_down && vk == 0x52 {
+                        state.find_replace.options.regex = !state.find_replace.options.regex;
+                        state.find_replace.invalidate_cache();
+                        state.find_replace.pending_live_update = true;
+                        state.find_replace.last_input_at =
+                            Instant::now() - std::time::Duration::from_millis(state.find_replace.debounce_ms);
+                        handled_find = true;
+                    }
+
+                    if handled_find {
+                        refresh_find_results(state);
                         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                         return LRESULT(0);
                     }
@@ -1155,8 +1562,39 @@ unsafe extern "system" fn window_proc(
         }
         WM_CHAR => {
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
+                let code = wparam.0 as u32;
+                if state.goto_visible {
+                    if let Some(ch) = char::from_u32(code) {
+                        if ch.is_ascii_digit() {
+                            state.goto_input.push(ch);
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                    }
+                }
+
+                if state.find_replace.find_visible {
+                    if let Some(ch) = char::from_u32(code) {
+                        if !ch.is_control() {
+                            match state.find_focus {
+                                FindFieldFocus::Query => {
+                                    let mut next = state.find_replace.query.clone();
+                                    next.push(ch);
+                                    state.find_replace.set_query(next);
+                                }
+                                FindFieldFocus::Replacement => {
+                                    let mut next = state.find_replace.replacement.clone();
+                                    next.push(ch);
+                                    state.find_replace.set_replacement(next);
+                                }
+                            }
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                    }
+                }
+
                 if state.command_palette.is_open() {
-                    let code = wparam.0 as u32;
                     if let Some(ch) = char::from_u32(code) {
                         if !ch.is_control() {
                             let event = UiInputEvent::Char(ch);
