@@ -1,5 +1,5 @@
-use std::{mem::ManuallyDrop, path::Path};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::{mem::ManuallyDrop, path::Path};
 
 use windows::{
     Win32::{
@@ -7,15 +7,16 @@ use windows::{
         Graphics::{
             Direct2D::{
                 Common::{D2D_RECT_F, D2D1_ALPHA_MODE_IGNORE, D2D1_PIXEL_FORMAT},
-                D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
-                D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE,
-                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device,
-                ID2D1DeviceContext, ID2D1Factory1, ID2D1Image, ID2D1SolidColorBrush,
+                D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET,
+                D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1CreateFactory,
+                ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image,
+                ID2D1SolidColorBrush,
             },
             Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
             Direct3D11::{
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
-                ID3D11DeviceContext,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice,
+                ID3D11Device, ID3D11DeviceContext,
             },
             DirectWrite::{
                 DWRITE_FACTORY_TYPE_SHARED, DWRITE_MEASURING_MODE_NATURAL, DWriteCreateFactory,
@@ -23,22 +24,23 @@ use windows::{
             },
             Dxgi::{
                 Common::{
-                    DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_UNSPECIFIED, DXGI_FORMAT_B8G8R8A8_UNORM,
-                    DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+                    DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_UNSPECIFIED,
+                    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
                 },
                 DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
-                DXGI_SWAP_EFFECT_DISCARD, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-                DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISurface,
-                IDXGISwapChain1,
+                DXGI_SWAP_EFFECT_DISCARD, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice,
+                IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
             },
         },
         UI::WindowsAndMessaging::GetClientRect,
     },
-    core::{Result, HRESULT, Interface, w},
+    core::{HRESULT, Interface, Result, w},
 };
 use windows_numerics::Vector2;
 
 use crate::{
+    render::image_cache::ImageCacheStats,
     render::perf::{DebugPerformancePanel, query_process_working_set_bytes},
     theme::{
         Theme,
@@ -48,6 +50,15 @@ use crate::{
 };
 
 const D2DERR_RECREATE_TARGET: HRESULT = HRESULT(0x8899000C_u32 as i32);
+
+#[derive(Debug, Clone, Default)]
+pub struct CanvasImageShellItem {
+    pub block_id: u64,
+    pub rect: UiRect,
+    pub selected: bool,
+    pub interpolation: String,
+    pub alt_text: String,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ShellRenderState {
@@ -97,6 +108,12 @@ pub struct ShellRenderState {
     pub canvas_content_height: f32,
     pub canvas_scroll_x: f32,
     pub canvas_scroll_y: f32,
+    pub canvas_images: Vec<CanvasImageShellItem>,
+    pub image_toolbar_visible: bool,
+    pub image_properties_visible: bool,
+    pub image_selected_size: String,
+    pub image_selected_meta: String,
+    pub image_selected_alt_text: String,
 }
 
 pub struct D2DRenderer {
@@ -121,7 +138,8 @@ pub struct D2DRenderer {
 impl D2DRenderer {
     pub fn new(hwnd: HWND, width: u32, height: u32, dpi: f32, theme: Theme) -> Result<Self> {
         unsafe {
-            let d2d_factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let d2d_factory: ID2D1Factory1 =
+                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
 
             let (d3d_device, d3d_context) = Self::create_d3d_device()?;
 
@@ -129,13 +147,8 @@ impl D2DRenderer {
             let adapter = dxgi_device.GetAdapter()?;
             let dxgi_factory: IDXGIFactory2 = adapter.GetParent()?;
 
-            let swap_chain = Self::create_swap_chain_for_hwnd(
-                &dxgi_factory,
-                &d3d_device,
-                hwnd,
-                width,
-                height,
-            )?;
+            let swap_chain =
+                Self::create_swap_chain_for_hwnd(&dxgi_factory, &d3d_device, hwnd, width, height)?;
 
             let d2d_device = d2d_factory.CreateDevice(&dxgi_device)?;
             let d2d_context = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
@@ -207,9 +220,24 @@ impl D2DRenderer {
         height: u32,
     ) -> Result<IDXGISwapChain1> {
         let attempts = [
-            (DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, 2, DXGI_ALPHA_MODE_IGNORE, "flip_sequential"),
-            (DXGI_SWAP_EFFECT_FLIP_DISCARD, 2, DXGI_ALPHA_MODE_IGNORE, "flip_discard"),
-            (DXGI_SWAP_EFFECT_DISCARD, 1, DXGI_ALPHA_MODE_UNSPECIFIED, "discard"),
+            (
+                DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                2,
+                DXGI_ALPHA_MODE_IGNORE,
+                "flip_sequential",
+            ),
+            (
+                DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                2,
+                DXGI_ALPHA_MODE_IGNORE,
+                "flip_discard",
+            ),
+            (
+                DXGI_SWAP_EFFECT_DISCARD,
+                1,
+                DXGI_ALPHA_MODE_UNSPECIFIED,
+                "discard",
+            ),
         ];
 
         let mut last_error = None;
@@ -219,7 +247,10 @@ impl D2DRenderer {
                 Height: height,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 Stereo: false.into(),
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: buffer_count,
                 Scaling: DXGI_SCALING_STRETCH,
@@ -229,13 +260,7 @@ impl D2DRenderer {
             };
 
             let result = unsafe {
-                dxgi_factory.CreateSwapChainForHwnd(
-                    d3d_device,
-                    hwnd,
-                    &swap_chain_desc,
-                    None,
-                    None,
-                )
+                dxgi_factory.CreateSwapChainForHwnd(d3d_device, hwnd, &swap_chain_desc, None, None)
             };
 
             match result {
@@ -265,8 +290,13 @@ impl D2DRenderer {
         unsafe {
             self.d2d_context.SetTarget(None::<&ID2D1Image>);
             self.target_bitmap = None;
-            self.swap_chain
-                .ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))?;
+            self.swap_chain.ResizeBuffers(
+                0,
+                width,
+                height,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG(0),
+            )?;
             self.recreate_target_bitmap()?;
         }
 
@@ -308,6 +338,10 @@ impl D2DRenderer {
         self.debug_panel.set_visible(visible);
     }
 
+    pub fn update_image_cache_stats(&mut self, stats: ImageCacheStats) {
+        self.debug_panel.update_image_cache_stats(stats);
+    }
+
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
     }
@@ -326,14 +360,22 @@ impl D2DRenderer {
 
             let tab_h = if shell.show_tabs { 36.0 } else { 0.0 };
             let sidebar_w = if shell.show_sidebar {
-                shell.sidebar_width.clamp(200.0, 400.0).min((width - 80.0).max(0.0))
+                shell
+                    .sidebar_width
+                    .clamp(200.0, 400.0)
+                    .min((width - 80.0).max(0.0))
             } else {
                 0.0
             };
             let toolbar_h = if shell.show_toolbar { 44.0 } else { 0.0 };
             let status_h = if shell.show_statusbar { 28.0 } else { 0.0 };
 
-            let tab_rect = D2D_RECT_F { left: 0.0, top: 0.0, right: width, bottom: tab_h };
+            let tab_rect = D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: width,
+                bottom: tab_h,
+            };
             let sidebar_rect = D2D_RECT_F {
                 left: 0.0,
                 top: tab_h,
@@ -407,7 +449,8 @@ impl D2DRenderer {
                     right: sidebar_w + 1.5,
                     bottom: (height - status_h - 4.0).max(tab_h + 6.0),
                 };
-                self.d2d_context.FillRectangle(&splitter_rect, &splitter_brush);
+                self.d2d_context
+                    .FillRectangle(&splitter_rect, &splitter_brush);
             }
 
             let text_brush = self.create_brush(self.theme.text_primary.as_d2d())?;
@@ -428,7 +471,10 @@ impl D2DRenderer {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
 
-                let active_panel = shell.active_sidebar_panel.encode_utf16().collect::<Vec<u16>>();
+                let active_panel = shell
+                    .active_sidebar_panel
+                    .encode_utf16()
+                    .collect::<Vec<u16>>();
                 self.d2d_context.DrawText(
                     &active_panel,
                     &text_format,
@@ -496,7 +542,8 @@ impl D2DRenderer {
                 let mut overlay = self.theme.surface_primary.as_d2d();
                 overlay.a = 0.94;
                 let overlay_brush = self.create_brush(overlay)?;
-                self.d2d_context.FillRectangle(&palette_rect, &overlay_brush);
+                self.d2d_context
+                    .FillRectangle(&palette_rect, &overlay_brush);
 
                 let border_brush = self.create_brush(self.theme.border_default.as_d2d())?;
                 self.d2d_context.DrawRectangle(
@@ -528,7 +575,8 @@ impl D2DRenderer {
                         break;
                     }
                     if idx == shell.command_palette_selected {
-                        let highlight_brush = self.create_brush(self.theme.surface_hover.as_d2d())?;
+                        let highlight_brush =
+                            self.create_brush(self.theme.surface_hover.as_d2d())?;
                         self.d2d_context.FillRectangle(
                             &D2D_RECT_F {
                                 left: palette_x + 8.0,
@@ -558,7 +606,8 @@ impl D2DRenderer {
             }
 
             if shell.find_visible && !shell.command_palette_open {
-                let panel_w = 460.0_f32.min((canvas_rect.right - canvas_rect.left - 20.0).max(300.0));
+                let panel_w =
+                    460.0_f32.min((canvas_rect.right - canvas_rect.left - 20.0).max(300.0));
                 let panel_h = if shell.replace_visible { 188.0 } else { 136.0 };
                 let panel_x = (canvas_rect.right - panel_w - 10.0).max(canvas_rect.left + 8.0);
                 let panel_y = canvas_rect.top + 10.0;
@@ -638,9 +687,7 @@ impl D2DRenderer {
 
                 let count_line = format!(
                     "{} ({}/{})",
-                    shell.find_result_count,
-                    shell.find_current,
-                    shell.find_total
+                    shell.find_result_count, shell.find_current, shell.find_total
                 );
                 let count_utf16 = count_line.encode_utf16().collect::<Vec<u16>>();
                 self.d2d_context.DrawText(
@@ -674,8 +721,9 @@ impl D2DRenderer {
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
 
-                    let actions =
-                        "[Ctrl+Enter] Replace Current   [Ctrl+Shift+Enter] Replace All".encode_utf16().collect::<Vec<u16>>();
+                    let actions = "[Ctrl+Enter] Replace Current   [Ctrl+Shift+Enter] Replace All"
+                        .encode_utf16()
+                        .collect::<Vec<u16>>();
                     self.d2d_context.DrawText(
                         &actions,
                         &text_format,
@@ -735,7 +783,8 @@ impl D2DRenderer {
             }
 
             if shell.goto_visible && !shell.command_palette_open {
-                let dialog_w = 260.0_f32.min((canvas_rect.right - canvas_rect.left - 20.0).max(180.0));
+                let dialog_w =
+                    260.0_f32.min((canvas_rect.right - canvas_rect.left - 20.0).max(180.0));
                 let dialog_h = 72.0;
                 let dialog_x = (canvas_rect.right - dialog_w - 10.0).max(canvas_rect.left + 8.0);
                 let dialog_y = canvas_rect.top + 10.0;
@@ -768,7 +817,9 @@ impl D2DRenderer {
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
-                let input = format!("Line/Page: {}", shell.goto_input).encode_utf16().collect::<Vec<u16>>();
+                let input = format!("Line/Page: {}", shell.goto_input)
+                    .encode_utf16()
+                    .collect::<Vec<u16>>();
                 self.d2d_context.DrawText(
                     &input,
                     &text_format,
@@ -777,6 +828,172 @@ impl D2DRenderer {
                         top: dialog.top + 30.0,
                         right: dialog.right - 10.0,
                         bottom: dialog.bottom - 10.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+
+            if shell.image_toolbar_visible {
+                let toolbar_w =
+                    520.0_f32.min((canvas_rect.right - canvas_rect.left - 20.0).max(320.0));
+                let toolbar_h = 70.0;
+                let toolbar_x = canvas_rect.left + 10.0;
+                let toolbar_y = canvas_rect.top + 10.0;
+                let toolbar = D2D_RECT_F {
+                    left: toolbar_x,
+                    top: toolbar_y,
+                    right: toolbar_x + toolbar_w,
+                    bottom: toolbar_y + toolbar_h,
+                };
+                let panel_bg = self.create_brush(self.theme.surface_primary.as_d2d())?;
+                let panel_border = self.create_brush(self.theme.border_default.as_d2d())?;
+                self.d2d_context.FillRectangle(&toolbar, &panel_bg);
+                self.d2d_context.DrawRectangle(
+                    &toolbar,
+                    &panel_border,
+                    1.0,
+                    None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                );
+
+                let actions = "Image Toolbar: Replace(Ctrl+R)  Delete(Del)  Align Left(Ctrl+L)  Center(Ctrl+E)  Right(Ctrl+I)  Border(Ctrl+Shift+B)";
+                let actions_utf16 = actions.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &actions_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: toolbar.left + 10.0,
+                        top: toolbar.top + 8.0,
+                        right: toolbar.right - 10.0,
+                        bottom: toolbar.top + 28.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let meta = format!(
+                    "{} | {}",
+                    shell.image_selected_size, shell.image_selected_meta
+                );
+                let meta_utf16 = meta.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &meta_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: toolbar.left + 10.0,
+                        top: toolbar.top + 30.0,
+                        right: toolbar.right - 10.0,
+                        bottom: toolbar.top + 50.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let alt = format!("Alt text: {}", shell.image_selected_alt_text);
+                let alt_utf16 = alt.encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &alt_utf16,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: toolbar.left + 10.0,
+                        top: toolbar.top + 48.0,
+                        right: toolbar.right - 10.0,
+                        bottom: toolbar.bottom - 6.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+
+            if shell.image_properties_visible {
+                let props_w =
+                    360.0_f32.min((canvas_rect.right - canvas_rect.left - 20.0).max(240.0));
+                let props_h = 118.0;
+                let props_x = canvas_rect.left + 12.0;
+                let props_y = canvas_rect.top + 86.0;
+                let props = D2D_RECT_F {
+                    left: props_x,
+                    top: props_y,
+                    right: props_x + props_w,
+                    bottom: props_y + props_h,
+                };
+                let panel_bg = self.create_brush(self.theme.surface_secondary.as_d2d())?;
+                let panel_border = self.create_brush(self.theme.border_default.as_d2d())?;
+                self.d2d_context.FillRectangle(&props, &panel_bg);
+                self.d2d_context.DrawRectangle(
+                    &props,
+                    &panel_border,
+                    1.0,
+                    None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                );
+
+                let line1 = "Image Properties".encode_utf16().collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &line1,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: props.left + 10.0,
+                        top: props.top + 8.0,
+                        right: props.right - 10.0,
+                        bottom: props.top + 28.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let line2 = format!("Size: {}", shell.image_selected_size)
+                    .encode_utf16()
+                    .collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &line2,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: props.left + 10.0,
+                        top: props.top + 30.0,
+                        right: props.right - 10.0,
+                        bottom: props.top + 50.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let line3 = format!("Alignment / Border: {}", shell.image_selected_meta)
+                    .encode_utf16()
+                    .collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &line3,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: props.left + 10.0,
+                        top: props.top + 50.0,
+                        right: props.right - 10.0,
+                        bottom: props.top + 70.0,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+
+                let line4 = format!(
+                    "Wrap: Inline/Float (drag to move) | Alt: {}",
+                    shell.image_selected_alt_text
+                )
+                .encode_utf16()
+                .collect::<Vec<u16>>();
+                self.d2d_context.DrawText(
+                    &line4,
+                    &text_format,
+                    &D2D_RECT_F {
+                        left: props.left + 10.0,
+                        top: props.top + 72.0,
+                        right: props.right - 10.0,
+                        bottom: props.bottom - 10.0,
                     },
                     &text_brush,
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -834,7 +1051,8 @@ impl D2DRenderer {
             if tab_h > 0.0 && !shell.tab_titles.is_empty() {
                 let mut x = 8.0;
                 for (idx, title) in shell.tab_titles.iter().take(8).enumerate() {
-                    let tab_w = ((width - 16.0) / shell.tab_titles.len().min(8) as f32).clamp(120.0, 220.0);
+                    let tab_w =
+                        ((width - 16.0) / shell.tab_titles.len().min(8) as f32).clamp(120.0, 220.0);
                     let rect = D2D_RECT_F {
                         left: x,
                         top: 4.0,
@@ -937,12 +1155,18 @@ impl D2DRenderer {
         Ok(())
     }
 
-    fn draw_canvas_background(&self, rect: D2D_RECT_F, settings: &BackgroundSettings) -> Result<()> {
+    fn draw_canvas_background(
+        &self,
+        rect: D2D_RECT_F,
+        settings: &BackgroundSettings,
+    ) -> Result<()> {
         match &settings.kind {
             BackgroundKind::Solid { color } => self.fill_rect(rect, *color),
-            BackgroundKind::Gradient { start, end, angle_degrees } => {
-                self.fill_gradient(rect, *start, *end, *angle_degrees)
-            }
+            BackgroundKind::Gradient {
+                start,
+                end,
+                angle_degrees,
+            } => self.fill_gradient(rect, *start, *end, *angle_degrees),
             BackgroundKind::Pattern {
                 style,
                 foreground,
@@ -956,14 +1180,13 @@ impl D2DRenderer {
                 opacity,
             } => {
                 self.fill_rect(rect, self.theme.canvas_bg)?;
-                let overlay = self.create_brush(
-                    windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
+                let overlay =
+                    self.create_brush(windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
                         r: 0.0,
                         g: 0.0,
                         b: 0.0,
                         a: (1.0 - opacity.clamp(0.0, 1.0)).clamp(0.0, 1.0) * 0.35,
-                    },
-                )?;
+                    })?;
                 unsafe {
                     self.d2d_context.FillRectangle(&rect, &overlay);
                 }
@@ -998,7 +1221,11 @@ impl D2DRenderer {
         }
     }
 
-    fn draw_document_canvas(&self, canvas_rect: D2D_RECT_F, shell: &ShellRenderState) -> Result<()> {
+    fn draw_document_canvas(
+        &self,
+        canvas_rect: D2D_RECT_F,
+        shell: &ShellRenderState,
+    ) -> Result<()> {
         let shadow_color = crate::ui::Color::rgba(
             self.theme.page_shadow.r,
             self.theme.page_shadow.g,
@@ -1083,7 +1310,7 @@ impl D2DRenderer {
                 }
 
                 if !drew_preview {
-                    self.draw_page_preview_content(page_rect, shell)?;
+                    self.draw_page_preview_content(page_rect, canvas_rect, shell)?;
                     drew_preview = true;
                 }
             }
@@ -1092,7 +1319,12 @@ impl D2DRenderer {
         self.draw_canvas_scrollbars(canvas_rect, shell)
     }
 
-    fn draw_page_preview_content(&self, page_rect: D2D_RECT_F, shell: &ShellRenderState) -> Result<()> {
+    fn draw_page_preview_content(
+        &self,
+        page_rect: D2D_RECT_F,
+        canvas_rect: D2D_RECT_F,
+        shell: &ShellRenderState,
+    ) -> Result<()> {
         let left_pad = 44.0;
         let top_pad = 46.0;
         let right_pad = 40.0;
@@ -1129,7 +1361,8 @@ impl D2DRenderer {
                 right: text_rect.right,
                 bottom: text_rect.top + 24.0,
             };
-            self.d2d_context.FillRectangle(&current_line, &line_highlight);
+            self.d2d_context
+                .FillRectangle(&current_line, &line_highlight);
             let selection_rect = D2D_RECT_F {
                 left: text_rect.left + 2.0,
                 top: text_rect.top + 3.0,
@@ -1170,13 +1403,128 @@ impl D2DRenderer {
                         right: (left + marker_w - 2.0).min(text_rect.right),
                         bottom: text_rect.top + 34.0,
                     };
-                    let brush = if shell.find_current > 0 && idx + 1 == shell.find_current.min(markers) {
-                        &current_match_brush
-                    } else {
-                        &all_match_brush
-                    };
+                    let brush =
+                        if shell.find_current > 0 && idx + 1 == shell.find_current.min(markers) {
+                            &current_match_brush
+                        } else {
+                            &all_match_brush
+                        };
                     unsafe {
                         self.d2d_context.FillRectangle(&rect, brush);
+                    }
+                }
+            }
+        }
+
+        if !shell.canvas_images.is_empty() {
+            let image_bg = self.create_brush(self.theme.surface_secondary.as_d2d())?;
+            let image_border = self.create_brush(self.theme.border_default.as_d2d())?;
+            let image_selected = self.create_brush(self.theme.accent.as_d2d())?;
+            let image_text = self.create_brush(self.theme.text_secondary.as_d2d())?;
+            let handle_brush = self.create_brush(self.theme.accent.as_d2d())?;
+
+            for image in shell.canvas_images.iter().take(12) {
+                let left = canvas_rect.left + image.rect.x;
+                let top = canvas_rect.top + image.rect.y;
+                let right = left + image.rect.width;
+                let bottom = top + image.rect.height;
+                let img_rect = D2D_RECT_F {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                };
+
+                if right < page_rect.left
+                    || left > page_rect.right
+                    || bottom < page_rect.top
+                    || top > page_rect.bottom
+                {
+                    continue;
+                }
+
+                unsafe {
+                    self.d2d_context.FillRectangle(&img_rect, &image_bg);
+                    self.d2d_context.DrawRectangle(
+                        &img_rect,
+                        if image.selected {
+                            &image_selected
+                        } else {
+                            &image_border
+                        },
+                        if image.selected { 2.0 } else { 1.0 },
+                        None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
+                    );
+                }
+
+                let label = if image.alt_text.is_empty() {
+                    format!("[Image #{}]", image.block_id)
+                } else {
+                    format!("[Image #{}] {}", image.block_id, image.alt_text)
+                };
+                let interpolation = image.interpolation.encode_utf16().collect::<Vec<u16>>();
+                let label_utf16 = label.encode_utf16().collect::<Vec<u16>>();
+                unsafe {
+                    self.d2d_context.DrawText(
+                        &label_utf16,
+                        &self.create_text_format()?,
+                        &D2D_RECT_F {
+                            left: left + 8.0,
+                            top: top + 6.0,
+                            right: right - 8.0,
+                            bottom: top + 24.0,
+                        },
+                        &image_text,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    self.d2d_context.DrawText(
+                        &interpolation,
+                        &self.create_text_format()?,
+                        &D2D_RECT_F {
+                            left: left + 8.0,
+                            top: bottom - 20.0,
+                            right: right - 8.0,
+                            bottom: bottom - 4.0,
+                        },
+                        &image_text,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+
+                if image.selected {
+                    let handle = 6.0;
+                    let handle_rects = [
+                        D2D_RECT_F {
+                            left: left - handle * 0.5,
+                            top: top - handle * 0.5,
+                            right: left + handle * 0.5,
+                            bottom: top + handle * 0.5,
+                        },
+                        D2D_RECT_F {
+                            left: right - handle * 0.5,
+                            top: top - handle * 0.5,
+                            right: right + handle * 0.5,
+                            bottom: top + handle * 0.5,
+                        },
+                        D2D_RECT_F {
+                            left: left - handle * 0.5,
+                            top: bottom - handle * 0.5,
+                            right: left + handle * 0.5,
+                            bottom: bottom + handle * 0.5,
+                        },
+                        D2D_RECT_F {
+                            left: right - handle * 0.5,
+                            top: bottom - handle * 0.5,
+                            right: right + handle * 0.5,
+                            bottom: bottom + handle * 0.5,
+                        },
+                    ];
+                    for rect in handle_rects {
+                        unsafe {
+                            self.d2d_context.FillRectangle(&rect, &handle_brush);
+                        }
                     }
                 }
             }
@@ -1219,7 +1567,11 @@ impl D2DRenderer {
         Ok(())
     }
 
-    fn draw_canvas_scrollbars(&self, canvas_rect: D2D_RECT_F, shell: &ShellRenderState) -> Result<()> {
+    fn draw_canvas_scrollbars(
+        &self,
+        canvas_rect: D2D_RECT_F,
+        shell: &ShellRenderState,
+    ) -> Result<()> {
         if !shell.canvas_scrollbar_visible && shell.canvas_scrollbar_alpha <= 0.01 {
             return Ok(());
         }
@@ -1353,7 +1705,10 @@ impl D2DRenderer {
                     while y <= rect.bottom {
                         self.d2d_context.DrawLine(
                             Vector2 { X: rect.left, Y: y },
-                            Vector2 { X: rect.right, Y: y },
+                            Vector2 {
+                                X: rect.right,
+                                Y: y,
+                            },
                             &brush,
                             1.0,
                             None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
@@ -1366,7 +1721,10 @@ impl D2DRenderer {
                     while x <= rect.right {
                         self.d2d_context.DrawLine(
                             Vector2 { X: x, Y: rect.top },
-                            Vector2 { X: x, Y: rect.bottom },
+                            Vector2 {
+                                X: x,
+                                Y: rect.bottom,
+                            },
                             &brush,
                             1.0,
                             None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
@@ -1374,13 +1732,18 @@ impl D2DRenderer {
                         x += step;
                     }
                 }
-                PatternStyle::LinesDiagonal | PatternStyle::CrossHatch | PatternStyle::GraphPaper => {
+                PatternStyle::LinesDiagonal
+                | PatternStyle::CrossHatch
+                | PatternStyle::GraphPaper => {
                     if matches!(style, PatternStyle::GraphPaper) {
                         let mut y = rect.top;
                         while y <= rect.bottom {
                             self.d2d_context.DrawLine(
                                 Vector2 { X: rect.left, Y: y },
-                                Vector2 { X: rect.right, Y: y },
+                                Vector2 {
+                                    X: rect.right,
+                                    Y: y,
+                                },
                                 &brush,
                                 1.0,
                                 None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
@@ -1391,7 +1754,10 @@ impl D2DRenderer {
                         while x <= rect.right {
                             self.d2d_context.DrawLine(
                                 Vector2 { X: x, Y: rect.top },
-                                Vector2 { X: x, Y: rect.bottom },
+                                Vector2 {
+                                    X: x,
+                                    Y: rect.bottom,
+                                },
                                 &brush,
                                 1.0,
                                 None::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>,
@@ -1442,7 +1808,8 @@ impl D2DRenderer {
                         let mut xi = 0u32;
                         let mut x = rect.left;
                         while x <= rect.right {
-                            let hash = ((xi.wrapping_mul(73856093)) ^ (yi.wrapping_mul(19349663))) & 0xFF;
+                            let hash =
+                                ((xi.wrapping_mul(73856093)) ^ (yi.wrapping_mul(19349663))) & 0xFF;
                             if hash < 84 {
                                 let dot = D2D_RECT_F {
                                     left: x,
@@ -1521,7 +1888,10 @@ impl D2DRenderer {
         }
     }
 
-    fn create_brush(&self, color: windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F) -> Result<ID2D1SolidColorBrush> {
+    fn create_brush(
+        &self,
+        color: windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F,
+    ) -> Result<ID2D1SolidColorBrush> {
         unsafe { self.d2d_context.CreateSolidColorBrush(&color, None) }
     }
 

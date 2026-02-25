@@ -10,9 +10,7 @@ use windows::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::{
             Dwm::{
-                DWMSBT_MAINWINDOW,
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
                 DwmSetWindowAttribute,
             },
             Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT},
@@ -20,19 +18,20 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
-            Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_SHIFT},
+            Input::KeyboardAndMouse::{
+                GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DELETE, VK_SHIFT,
+            },
             Shell::{DragAcceptFiles, HDROP},
             WindowsAndMessaging::{
-                AdjustWindowRectEx, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
-                DefWindowProcW, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetMessageW,
-                GetSystemMetrics, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG, PostQuitMessage,
-                RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-                SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-                WINDOW_EX_STYLE, WM_CHAR, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_KEYDOWN,
-                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-                WM_SETTINGCHANGE, WM_SIZE,
-                WNDCLASSEXW,
-                WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+                AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
+                CreateWindowExW, DefWindowProcW, DispatchMessageW, GWLP_USERDATA, GetClientRect,
+                GetMessageW, GetSystemMetrics, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG,
+                PostQuitMessage, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
+                SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+                TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
+                WM_DROPFILES, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+                WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETTINGCHANGE,
+                WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
             },
         },
     },
@@ -42,35 +41,36 @@ use windows::{
 use crate::{
     app::AppState,
     document::{
-        DocumentFormat,
-        detect_format,
+        DocumentFormat, detect_format,
         docx::parser::parse_docx,
         markdown::MarkdownDocument,
-        model::{Block, BlockId, DocumentModel},
+        model::{Block, BlockId, DocumentModel, ImageAlignment, ImageBorder, ImageBorderStyle},
         txt::TextDocument,
     },
-    editor::search::{FindReplaceState, replace_all, replace_current, replacement_preview},
+    editor::{
+        clipboard::read_clipboard_image,
+        image_ops::load_supported_image,
+        search::{FindReplaceState, replace_all, replace_current, replacement_preview},
+    },
     render::canvas::PageLayoutMode,
     render::d2d::{D2DRenderer, ShellRenderState},
+    render::image_cache::{ImageDecodeCache, interpolation_hint, resolve_image_data},
     settings::schema::Settings,
-    theme::{Theme, ThemeManager, backgrounds::{BackgroundKind, from_canvas_preference}},
+    theme::{
+        Theme, ThemeManager,
+        backgrounds::{BackgroundKind, from_canvas_preference},
+    },
     ui::{
+        InputEvent as UiInputEvent, Point as UiPoint, Rect as UiRect, UIComponent,
         command_palette::CommandPalette,
-        InputEvent as UiInputEvent,
-        Point as UiPoint,
-        Rect as UiRect,
-        UIComponent,
         sidebar::{SearchResultItem, Sidebar, SidebarIntent, SidebarPanel},
         statusbar::{StatusAction, StatusBar, StatusBarInfo},
         tabs::{TabKind, TabsBar},
         toolbar::{Toolbar, ToolbarAction},
     },
     window::integration::{
-        DropAction,
-        JumpListState,
-        PrintState,
-        extract_drop_payload,
-        parse_startup_files_from_cli,
+        DropAction, JumpListState, PrintState, extract_drop_payload, parse_startup_files_from_cli,
+        pick_image_file,
     },
 };
 
@@ -86,6 +86,32 @@ pub struct AppWindow {
 enum FindFieldFocus {
     Query,
     Replacement,
+}
+
+#[derive(Debug, Clone)]
+struct CanvasImageOverlay {
+    block_id: BlockId,
+    rect: UiRect,
+    interpolation: String,
+    alt_text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageDragKind {
+    Move,
+    CornerResize,
+    EdgeResizeHorizontal,
+    EdgeResizeVertical,
+}
+
+#[derive(Debug, Clone)]
+struct ImageDragState {
+    block_id: BlockId,
+    start_mouse: UiPoint,
+    start_width: f32,
+    start_height: f32,
+    start_alignment: ImageAlignment,
+    kind: ImageDragKind,
 }
 
 struct WindowState {
@@ -104,6 +130,11 @@ struct WindowState {
     command_palette: CommandPalette,
     find_replace: FindReplaceState,
     find_focus: FindFieldFocus,
+    image_cache: ImageDecodeCache,
+    canvas_image_overlays: Vec<CanvasImageOverlay>,
+    selected_image: Option<BlockId>,
+    image_drag: Option<ImageDragState>,
+    image_properties_visible: bool,
     goto_visible: bool,
     goto_input: String,
     toolbar: Toolbar,
@@ -125,7 +156,7 @@ impl AppWindow {
 
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(window_proc),
             hInstance: hinstance,
             hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
@@ -176,6 +207,11 @@ impl AppWindow {
             command_palette: CommandPalette::default(),
             find_replace: FindReplaceState::default(),
             find_focus: FindFieldFocus::Query,
+            image_cache: ImageDecodeCache::default(),
+            canvas_image_overlays: Vec::new(),
+            selected_image: None,
+            image_drag: None,
+            image_properties_visible: false,
             goto_visible: false,
             goto_input: String::new(),
             toolbar: Toolbar::default(),
@@ -326,6 +362,14 @@ fn sync_sidebar_with_active_tab(state: &mut WindowState) {
             .or_else(|| tab.document.metadata.file_path.clone());
     }
 
+    if let Some(selected) = state.selected_image {
+        if active_image_ref(state, selected).is_none() {
+            state.selected_image = None;
+            state.image_drag = None;
+            state.image_properties_visible = false;
+        }
+    }
+
     if root_path.is_none() {
         root_path = std::env::current_dir().ok();
     }
@@ -334,9 +378,7 @@ fn sync_sidebar_with_active_tab(state: &mut WindowState) {
         let root = if path.is_dir() {
             path
         } else {
-            path.parent()
-                .map(Path::to_path_buf)
-                .unwrap_or(path)
+            path.parent().map(Path::to_path_buf).unwrap_or(path)
         };
         if state.sidebar.file_root.as_ref() != Some(&root) {
             let _ = state.sidebar.open_folder(root);
@@ -348,7 +390,9 @@ fn open_path_from_sidebar(state: &mut WindowState, path: PathBuf, new_tab: bool)
     let title = document_title_from_path(&path);
     let document = load_document_for_path(&path);
     if new_tab {
-        state.tabs.open_document_tab(title.clone(), Some(path), document);
+        state
+            .tabs
+            .open_document_tab(title.clone(), Some(path), document);
     } else if let Some(tab) = state.tabs.active_tab_mut() {
         tab.title = title.clone();
         tab.kind = TabKind::Document;
@@ -358,7 +402,9 @@ fn open_path_from_sidebar(state: &mut WindowState, path: PathBuf, new_tab: bool)
         tab.canvas = Default::default();
         tab.dirty = false;
     } else {
-        state.tabs.open_document_tab(title.clone(), Some(path), document);
+        state
+            .tabs
+            .open_document_tab(title.clone(), Some(path), document);
     }
     state.app_state.status_text = format!("Opened {title}");
     sync_sidebar_with_active_tab(state);
@@ -389,6 +435,401 @@ fn apply_pending_sidebar_intents(state: &mut WindowState) -> bool {
         }
     }
     changed
+}
+
+fn canvas_origin(state: &WindowState) -> UiPoint {
+    let tab_h = if state.app_state.show_tabs { 36.0 } else { 0.0 };
+    let toolbar_h = if state.app_state.show_toolbar {
+        44.0
+    } else {
+        0.0
+    };
+    let sidebar_w = if state.app_state.show_sidebar {
+        state.app_state.sidebar_width.clamp(200.0, 400.0)
+    } else {
+        0.0
+    };
+    UiPoint {
+        x: sidebar_w,
+        y: tab_h + toolbar_h,
+    }
+}
+
+fn contains_rect(rect: UiRect, point: UiPoint) -> bool {
+    point.x >= rect.x
+        && point.x <= rect.x + rect.width
+        && point.y >= rect.y
+        && point.y <= rect.y + rect.height
+}
+
+fn active_image_mut(
+    state: &mut WindowState,
+    block_id: BlockId,
+) -> Option<&mut crate::document::model::ImageBlock> {
+    state
+        .tabs
+        .active_tab_mut()
+        .and_then(|tab| tab.document.find_image_block_mut(block_id))
+}
+
+fn active_image_ref(
+    state: &WindowState,
+    block_id: BlockId,
+) -> Option<&crate::document::model::ImageBlock> {
+    state.tabs.active_tab().and_then(|tab| {
+        tab.document.content.iter().find_map(|block| match block {
+            Block::Image(image) if image.id == block_id => Some(image),
+            _ => None,
+        })
+    })
+}
+
+fn insert_image_from_path(
+    state: &mut WindowState,
+    path: &Path,
+) -> std::result::Result<BlockId, String> {
+    let asset = load_supported_image(path)?;
+    let alt_text = path
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("image")
+        .to_string();
+    let source_path = Some(path.to_path_buf());
+    insert_loaded_image(state, asset, source_path, alt_text)
+}
+
+fn insert_loaded_image(
+    state: &mut WindowState,
+    asset: crate::editor::image_ops::LoadedImageAsset,
+    source_path: Option<PathBuf>,
+    alt_text: String,
+) -> std::result::Result<BlockId, String> {
+    let inserted = {
+        let Some(tab) = state.tabs.active_tab_mut() else {
+            return Err("no active tab".to_string());
+        };
+        let after = Some(tab.cursor.primary.block_id);
+        let block_id = tab.document.insert_embedded_image_after(
+            after,
+            asset.bytes,
+            asset.mime,
+            asset.width,
+            asset.height,
+            source_path,
+            alt_text,
+        );
+        tab.cursor.primary.block_id = block_id;
+        tab.cursor.primary.offset = 0;
+        tab.dirty = true;
+        block_id
+    };
+
+    state.selected_image = Some(inserted);
+    state.image_properties_visible = false;
+    sync_sidebar_with_active_tab(state);
+    Ok(inserted)
+}
+
+fn insert_images_from_paths(state: &mut WindowState, paths: &[PathBuf]) -> (usize, usize) {
+    let mut inserted = 0usize;
+    let mut failed = 0usize;
+    for path in paths {
+        if insert_image_from_path(state, path).is_ok() {
+            inserted += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    (inserted, failed)
+}
+
+fn insert_image_from_clipboard(state: &mut WindowState) -> std::result::Result<BlockId, String> {
+    let Some(payload) = read_clipboard_image().map_err(|e| e.to_string())? else {
+        return Err("clipboard does not contain image data".to_string());
+    };
+    insert_loaded_image(
+        state,
+        crate::editor::image_ops::LoadedImageAsset {
+            bytes: payload.bytes,
+            mime: payload.mime,
+            width: payload.width,
+            height: payload.height,
+        },
+        None,
+        "Clipboard Image".to_string(),
+    )
+}
+
+fn collect_canvas_image_overlays(
+    tab: &crate::ui::tabs::TabState,
+    _selected_image: Option<BlockId>,
+    image_cache: &mut ImageDecodeCache,
+) -> Vec<CanvasImageOverlay> {
+    let page_rect = tab
+        .canvas
+        .page_rects(&tab.document)
+        .first()
+        .copied()
+        .unwrap_or(UiRect {
+            x: 0.0,
+            y: 0.0,
+            width: tab.canvas.viewport.width.max(1.0),
+            height: tab.canvas.viewport.height.max(1.0),
+        });
+
+    let content_left = page_rect.x + 46.0;
+    let content_right = page_rect.x + page_rect.width - 46.0;
+    let max_width = (content_right - content_left).max(72.0);
+    let mut cursor_y = page_rect.y + 86.0;
+    let bottom_limit = page_rect.y + page_rect.height - 50.0;
+
+    let mut overlays = Vec::new();
+    let mut visible_hashes = Vec::new();
+
+    for block in &tab.document.content {
+        let Block::Image(image) = block else {
+            continue;
+        };
+        let zoom = tab.canvas.zoom.max(0.25);
+        let width = (image.width * zoom * 0.72).clamp(56.0, max_width);
+        let mut height = (image.height * zoom * 0.72).clamp(42.0, page_rect.height * 0.5);
+
+        if image.width > 0.0 && image.height > 0.0 {
+            let ratio = (image.height / image.width).max(0.08);
+            height = (width * ratio).clamp(42.0, page_rect.height * 0.5);
+        }
+
+        if cursor_y + height > bottom_limit {
+            break;
+        }
+
+        let x = match image.alignment {
+            ImageAlignment::Left | ImageAlignment::Inline | ImageAlignment::Float => content_left,
+            ImageAlignment::Center => content_left + (max_width - width) * 0.5,
+            ImageAlignment::Right => content_right - width,
+        };
+        let rect = UiRect {
+            x,
+            y: cursor_y,
+            width,
+            height,
+        };
+
+        let scale = if image.original_width > 0 {
+            width / image.original_width as f32
+        } else {
+            1.0
+        };
+        let interpolation = interpolation_hint(scale).to_string();
+
+        if let Some(data) = resolve_image_data(image, &tab.document) {
+            let thumbnail = if scale < 0.45 { Some(384) } else { None };
+            if let Ok(decoded) = image_cache.get_or_decode(&data, thumbnail) {
+                visible_hashes.push(decoded.source_hash);
+            }
+        }
+
+        overlays.push(CanvasImageOverlay {
+            block_id: image.id,
+            rect,
+            interpolation,
+            alt_text: image.alt_text.clone(),
+        });
+        cursor_y += height + 16.0;
+
+        if overlays.len() >= 12 {
+            break;
+        }
+    }
+
+    image_cache.mark_visible_hashes(visible_hashes.as_slice());
+    overlays
+}
+
+fn image_drag_kind_for_point(rect: UiRect, point: UiPoint) -> ImageDragKind {
+    let edge = 8.0;
+    let near_left = (point.x - rect.x).abs() <= edge;
+    let near_right = (point.x - (rect.x + rect.width)).abs() <= edge;
+    let near_top = (point.y - rect.y).abs() <= edge;
+    let near_bottom = (point.y - (rect.y + rect.height)).abs() <= edge;
+
+    if (near_left || near_right) && (near_top || near_bottom) {
+        return ImageDragKind::CornerResize;
+    }
+    if near_left || near_right {
+        return ImageDragKind::EdgeResizeHorizontal;
+    }
+    if near_top || near_bottom {
+        return ImageDragKind::EdgeResizeVertical;
+    }
+    ImageDragKind::Move
+}
+
+fn begin_image_interaction(state: &mut WindowState, point: UiPoint) -> bool {
+    let origin = canvas_origin(state);
+    let local = UiPoint {
+        x: point.x - origin.x,
+        y: point.y - origin.y,
+    };
+
+    let hit = state
+        .canvas_image_overlays
+        .iter()
+        .rev()
+        .find(|overlay| contains_rect(overlay.rect, local))
+        .cloned();
+    let Some(hit_overlay) = hit else {
+        return false;
+    };
+
+    state.selected_image = Some(hit_overlay.block_id);
+    state.image_properties_visible = false;
+
+    if let Some(image) = active_image_ref(state, hit_overlay.block_id) {
+        state.image_drag = Some(ImageDragState {
+            block_id: hit_overlay.block_id,
+            start_mouse: local,
+            start_width: image.width,
+            start_height: image.height,
+            start_alignment: image.alignment.clone(),
+            kind: image_drag_kind_for_point(hit_overlay.rect, local),
+        });
+        state.app_state.status_text = format!("Selected image {}", hit_overlay.block_id.0);
+        return true;
+    }
+
+    false
+}
+
+fn update_image_drag(state: &mut WindowState, point: UiPoint, shift_down: bool) -> bool {
+    let Some(drag) = state.image_drag.clone() else {
+        return false;
+    };
+    let origin = canvas_origin(state);
+    let local = UiPoint {
+        x: point.x - origin.x,
+        y: point.y - origin.y,
+    };
+    let delta_x = local.x - drag.start_mouse.x;
+    let delta_y = local.y - drag.start_mouse.y;
+
+    let mut changed = false;
+    let zoom = state
+        .tabs
+        .active_tab()
+        .map(|tab| tab.canvas.zoom.max(0.25))
+        .unwrap_or(1.0);
+
+    if let Some(image) = active_image_mut(state, drag.block_id) {
+        match drag.kind {
+            ImageDragKind::Move => {
+                image.alignment = if delta_x < -40.0 {
+                    ImageAlignment::Left
+                } else if delta_x > 40.0 {
+                    ImageAlignment::Right
+                } else {
+                    drag.start_alignment.clone()
+                };
+            }
+            ImageDragKind::CornerResize => {
+                let mut width = (drag.start_width + delta_x / zoom).max(24.0);
+                let mut height = (drag.start_height + delta_y / zoom).max(24.0);
+                if shift_down {
+                    let ratio = (drag.start_width / drag.start_height.max(1.0)).max(0.05);
+                    if delta_x.abs() >= delta_y.abs() {
+                        height = (width / ratio).max(24.0);
+                    } else {
+                        width = (height * ratio).max(24.0);
+                    }
+                }
+                image.width = width;
+                image.height = height;
+            }
+            ImageDragKind::EdgeResizeHorizontal => {
+                image.width = (drag.start_width + delta_x / zoom).max(24.0);
+            }
+            ImageDragKind::EdgeResizeVertical => {
+                image.height = (drag.start_height + delta_y / zoom).max(24.0);
+            }
+        }
+        changed = true;
+    }
+
+    if changed {
+        if let Some(tab) = state.tabs.active_tab_mut() {
+            tab.document.dirty = true;
+            tab.dirty = true;
+        }
+        state.app_state.status_text = if let Some(image) = active_image_ref(state, drag.block_id) {
+            format!(
+                "Image {} {:.0}x{:.0} ({:?})",
+                drag.block_id.0, image.width, image.height, image.alignment
+            )
+        } else {
+            "Image updated".to_string()
+        };
+    }
+
+    changed
+}
+
+fn delete_selected_image(state: &mut WindowState) -> bool {
+    let Some(selected) = state.selected_image else {
+        return false;
+    };
+    let mut removed = false;
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        removed = tab.document.remove_image_block(selected);
+        if removed {
+            tab.dirty = true;
+            tab.cursor.primary.offset = 0;
+        }
+    }
+    if removed {
+        state.selected_image = None;
+        state.image_drag = None;
+        state.image_properties_visible = false;
+        sync_sidebar_with_active_tab(state);
+    }
+    removed
+}
+
+fn align_selected_image(state: &mut WindowState, alignment: ImageAlignment) -> bool {
+    let Some(selected) = state.selected_image else {
+        return false;
+    };
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        if let Some(image) = tab.document.find_image_block_mut(selected) {
+            image.alignment = alignment;
+            tab.document.dirty = true;
+            tab.dirty = true;
+            return true;
+        }
+    }
+    false
+}
+
+fn toggle_selected_image_border(state: &mut WindowState) -> bool {
+    let Some(selected) = state.selected_image else {
+        return false;
+    };
+    if let Some(tab) = state.tabs.active_tab_mut() {
+        if let Some(image) = tab.document.find_image_block_mut(selected) {
+            image.border = if image.border.is_some() {
+                None
+            } else {
+                Some(ImageBorder {
+                    style: ImageBorderStyle::Solid,
+                    width: 1.0,
+                    color: crate::ui::Color::rgb(0.35, 0.54, 0.92),
+                })
+            };
+            tab.document.dirty = true;
+            tab.dirty = true;
+            return true;
+        }
+    }
+    false
 }
 
 fn collect_visible_block_ids_for_search(tab: &mut crate::ui::tabs::TabState) -> Vec<BlockId> {
@@ -455,7 +896,10 @@ fn process_find_background_search(state: &mut WindowState, budget_blocks: usize)
     changed
 }
 
-fn jump_to_search_match(state: &mut WindowState, search_match: &crate::editor::search::SearchMatch) {
+fn jump_to_search_match(
+    state: &mut WindowState,
+    search_match: &crate::editor::search::SearchMatch,
+) {
     if let Some(tab) = state.tabs.active_tab_mut() {
         tab.cursor.primary.block_id = search_match.block_id;
         tab.cursor.primary.offset = search_match.start;
@@ -596,13 +1040,21 @@ fn block_snippet(document: &DocumentModel, block_id: BlockId) -> String {
 
 fn canvas_viewport_size(state: &WindowState, width: f32, height: f32) -> (f32, f32) {
     let tab_h = if state.app_state.show_tabs { 36.0 } else { 0.0 };
-    let status_h = if state.app_state.show_statusbar { 28.0 } else { 0.0 };
+    let status_h = if state.app_state.show_statusbar {
+        28.0
+    } else {
+        0.0
+    };
     let sidebar_w = if state.app_state.show_sidebar {
         state.app_state.sidebar_width.clamp(200.0, 400.0)
     } else {
         0.0
     };
-    let toolbar_h = if state.app_state.show_toolbar { 44.0 } else { 0.0 };
+    let toolbar_h = if state.app_state.show_toolbar {
+        44.0
+    } else {
+        0.0
+    };
     (
         (width - sidebar_w).max(1.0),
         (height - tab_h - toolbar_h - status_h).max(1.0),
@@ -611,13 +1063,21 @@ fn canvas_viewport_size(state: &WindowState, width: f32, height: f32) -> (f32, f
 
 fn relayout_shell(state: &mut WindowState, width: f32, height: f32) {
     let tab_h = if state.app_state.show_tabs { 36.0 } else { 0.0 };
-    let status_h = if state.app_state.show_statusbar { 28.0 } else { 0.0 };
+    let status_h = if state.app_state.show_statusbar {
+        28.0
+    } else {
+        0.0
+    };
     let sidebar_w = if state.app_state.show_sidebar {
         state.app_state.sidebar_width.clamp(200.0, 400.0)
     } else {
         0.0
     };
-    let toolbar_h = if state.app_state.show_toolbar { 44.0 } else { 0.0 };
+    let toolbar_h = if state.app_state.show_toolbar {
+        44.0
+    } else {
+        0.0
+    };
 
     state.tabs.set_visible(state.app_state.show_tabs);
     state.sidebar.set_visible(state.app_state.show_sidebar);
@@ -762,7 +1222,11 @@ fn collect_preview_lines(document: &DocumentModel, max_lines: usize) -> Vec<Stri
                 }
             }
             Block::CodeBlock(c) => {
-                let line = if c.code.is_empty() { "code block" } else { &c.code };
+                let line = if c.code.is_empty() {
+                    "code block"
+                } else {
+                    &c.code
+                };
                 out.push(line.lines().next().unwrap_or("code block").to_string());
             }
             Block::List(list) => {
@@ -830,48 +1294,58 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
     let mut canvas_content_height = 1.0f32;
     let mut canvas_scroll_x = 0.0f32;
     let mut canvas_scroll_y = 0.0f32;
+    let mut canvas_images = Vec::new();
     let mut current_block = None;
+    let selected_image_id = state.selected_image;
 
-    if let Some(tab) = state.tabs.active_tab_mut() {
-        (word_count, character_count) = collect_document_stats(&tab.document);
-        let visible_indices = tab.canvas.cull_and_cache_visible_pages(&tab.document);
-        let all_page_rects = tab.canvas.page_rects(&tab.document);
-        let first_visible_index = visible_indices.first().copied();
+    {
+        let (tabs, image_cache) = (&mut state.tabs, &mut state.image_cache);
+        if let Some(tab) = tabs.active_tab_mut() {
+            (word_count, character_count) = collect_document_stats(&tab.document);
+            let visible_indices = tab.canvas.cull_and_cache_visible_pages(&tab.document);
+            let all_page_rects = tab.canvas.page_rects(&tab.document);
+            let first_visible_index = visible_indices.first().copied();
 
-        for page_index_visible in visible_indices {
-            if let Some(rect) = all_page_rects.get(page_index_visible).copied() {
-                canvas_page_rects.push(rect);
+            for page_index_visible in visible_indices {
+                if let Some(rect) = all_page_rects.get(page_index_visible).copied() {
+                    canvas_page_rects.push(rect);
+                }
             }
+
+            page_count = all_page_rects.len().max(1);
+            page_index = first_visible_index.map(|idx| idx + 1).unwrap_or(1);
+
+            canvas_show_margin_guides = tab.canvas.show_margin_guides;
+            canvas_cursor_visible = tab.canvas.cursor.visible;
+            canvas_scrollbar_visible = tab.canvas.scrollbar.visible;
+            canvas_scrollbar_alpha = tab.canvas.scrollbar.alpha;
+            canvas_viewport_width = tab.canvas.viewport.width;
+            canvas_viewport_height = tab.canvas.viewport.height;
+            canvas_scroll_x = tab.canvas.scroll.x;
+            canvas_scroll_y = tab.canvas.scroll.y;
+            let content_size = tab.canvas.content_size(&tab.document);
+            canvas_content_width = content_size.width.max(1.0);
+            canvas_content_height = content_size.height.max(1.0);
+
+            view_mode = match tab.canvas.layout_mode {
+                PageLayoutMode::SinglePage => "Single Page".to_string(),
+                PageLayoutMode::Continuous => "Continuous".to_string(),
+                PageLayoutMode::ReadMode => "Read Mode".to_string(),
+            };
+            zoom_percent = (tab.canvas.zoom * 100.0).round().clamp(25.0, 500.0) as u16;
+            file_format = format!("{:?}", tab.document.metadata.format).to_uppercase();
+            column = tab.cursor.primary.offset.saturating_add(1);
+            line = 1;
+            current_block = Some(tab.cursor.primary.block_id);
+            canvas_preview_lines = collect_preview_lines(&tab.document, 40);
+            canvas_images = collect_canvas_image_overlays(tab, selected_image_id, image_cache);
         }
-
-        page_count = all_page_rects.len().max(1);
-        page_index = first_visible_index.map(|idx| idx + 1).unwrap_or(1);
-
-        canvas_show_margin_guides = tab.canvas.show_margin_guides;
-        canvas_cursor_visible = tab.canvas.cursor.visible;
-        canvas_scrollbar_visible = tab.canvas.scrollbar.visible;
-        canvas_scrollbar_alpha = tab.canvas.scrollbar.alpha;
-        canvas_viewport_width = tab.canvas.viewport.width;
-        canvas_viewport_height = tab.canvas.viewport.height;
-        canvas_scroll_x = tab.canvas.scroll.x;
-        canvas_scroll_y = tab.canvas.scroll.y;
-        let content_size = tab.canvas.content_size(&tab.document);
-        canvas_content_width = content_size.width.max(1.0);
-        canvas_content_height = content_size.height.max(1.0);
-
-        view_mode = match tab.canvas.layout_mode {
-            PageLayoutMode::SinglePage => "Single Page".to_string(),
-            PageLayoutMode::Continuous => "Continuous".to_string(),
-            PageLayoutMode::ReadMode => "Read Mode".to_string(),
-        };
-        zoom_percent = (tab.canvas.zoom * 100.0).round().clamp(25.0, 500.0) as u16;
-        file_format = format!("{:?}", tab.document.metadata.format).to_uppercase();
-        column = tab.cursor.primary.offset.saturating_add(1);
-        line = 1;
-        current_block = Some(tab.cursor.primary.block_id);
-        canvas_preview_lines = collect_preview_lines(&tab.document, 40);
     }
     state.sidebar.set_current_outline_block(current_block);
+    state.canvas_image_overlays = canvas_images.clone();
+    if let Some(renderer) = &mut state.renderer {
+        renderer.update_image_cache_stats(state.image_cache.stats());
+    }
 
     state.statusbar.set_info(StatusBarInfo {
         page_index,
@@ -938,6 +1412,33 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let selected_image = state
+        .selected_image
+        .and_then(|id| active_image_ref(state, id).map(|image| (id, image)))
+        .map(|(id, image)| {
+            let alignment = match image.alignment {
+                ImageAlignment::Inline => "Inline",
+                ImageAlignment::Left => "Left",
+                ImageAlignment::Center => "Center",
+                ImageAlignment::Right => "Right",
+                ImageAlignment::Float => "Float",
+            };
+            let border = if image.border.is_some() {
+                "Border on"
+            } else {
+                "Border off"
+            };
+            (
+                id,
+                format!("{:.0} x {:.0} pt", image.width, image.height),
+                format!("{alignment} | {border}"),
+                if image.alt_text.is_empty() {
+                    "No alt text".to_string()
+                } else {
+                    image.alt_text.clone()
+                },
+            )
+        });
 
     ShellRenderState {
         show_tabs: state.app_state.show_tabs,
@@ -979,7 +1480,9 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         goto_input: state.goto_input.clone(),
         status_left: state.statusbar.left_text(),
         status_right: state.statusbar.right_text(),
-        canvas_background: from_canvas_preference(&state.app_state.settings.appearance.canvas_background),
+        canvas_background: from_canvas_preference(
+            &state.app_state.settings.appearance.canvas_background,
+        ),
         canvas_page_rects,
         canvas_preview_lines,
         canvas_show_margin_guides,
@@ -992,6 +1495,30 @@ fn build_shell_render_state(state: &mut WindowState) -> ShellRenderState {
         canvas_content_height,
         canvas_scroll_x,
         canvas_scroll_y,
+        canvas_images: canvas_images
+            .iter()
+            .map(|overlay| crate::render::d2d::CanvasImageShellItem {
+                block_id: overlay.block_id.0,
+                rect: overlay.rect,
+                selected: state.selected_image == Some(overlay.block_id),
+                interpolation: overlay.interpolation.clone(),
+                alt_text: overlay.alt_text.clone(),
+            })
+            .collect(),
+        image_toolbar_visible: state.selected_image.is_some(),
+        image_properties_visible: state.image_properties_visible,
+        image_selected_size: selected_image
+            .as_ref()
+            .map(|(_, size, _, _)| size.clone())
+            .unwrap_or_default(),
+        image_selected_meta: selected_image
+            .as_ref()
+            .map(|(_, _, meta, _)| meta.clone())
+            .unwrap_or_default(),
+        image_selected_alt_text: selected_image
+            .as_ref()
+            .map(|(_, _, _, alt)| alt.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -1061,8 +1588,10 @@ unsafe extern "system" fn window_proc(
 
                 if !state.startup_files.is_empty() {
                     state.dropped_files = state.startup_files.clone();
-                    state.app_state.status_text =
-                        format!("Opening {} file(s) from command line", state.startup_files.len());
+                    state.app_state.status_text = format!(
+                        "Opening {} file(s) from command line",
+                        state.startup_files.len()
+                    );
                     for path in &state.startup_files {
                         state.jump_list.add_recent_file(path.clone());
                         let title = path
@@ -1070,9 +1599,10 @@ unsafe extern "system" fn window_proc(
                             .and_then(|v| v.to_str())
                             .unwrap_or("Document")
                             .to_string();
+                        let document = load_document_for_path(path.as_path());
                         state
                             .tabs
-                            .open_document_tab(title, Some(path.clone()), DocumentModel::default());
+                            .open_document_tab(title, Some(path.clone()), document);
                     }
                 } else {
                     let _ = state.tabs.new_blank_tab();
@@ -1162,7 +1692,8 @@ unsafe extern "system" fn window_proc(
                 }
                 if state.find_replace.should_live_update(now) {
                     let refreshed = refresh_find_results(state);
-                    needs_next_frame |= refreshed || state.find_replace.has_pending_background_search();
+                    needs_next_frame |=
+                        refreshed || state.find_replace.has_pending_background_search();
                 }
                 if state.find_replace.has_pending_background_search() {
                     let chunk_changed = process_find_background_search(state, 256);
@@ -1171,7 +1702,8 @@ unsafe extern "system" fn window_proc(
                         state.app_state.status_text = state.find_replace.result_count_text.clone();
                     }
                 }
-                let background = from_canvas_preference(&state.app_state.settings.appearance.canvas_background);
+                let background =
+                    from_canvas_preference(&state.app_state.settings.appearance.canvas_background);
                 if matches!(background.kind, BackgroundKind::AnimatedGradient { .. }) {
                     needs_next_frame = true;
                 }
@@ -1208,12 +1740,14 @@ unsafe extern "system" fn window_proc(
                     tab.canvas.set_viewport(canvas_w, canvas_h);
                     if ctrl_down {
                         tab.canvas.handle_mouse_wheel(delta, true, cursor_in_canvas);
-                        state.app_state.status_text = format!("Zoom: {}%", (tab.canvas.zoom_target * 100.0).round() as u16);
+                        state.app_state.status_text =
+                            format!("Zoom: {}%", (tab.canvas.zoom_target * 100.0).round() as u16);
                     } else if shift_down {
                         tab.canvas.handle_horizontal_wheel(delta);
                         state.app_state.status_text = "Horizontal scroll".to_string();
                     } else {
-                        tab.canvas.handle_mouse_wheel(delta, false, cursor_in_canvas);
+                        tab.canvas
+                            .handle_mouse_wheel(delta, false, cursor_in_canvas);
                         state.app_state.status_text = "Scroll".to_string();
                     }
                     tab.canvas.clamp_scroll(&tab.document);
@@ -1247,7 +1781,9 @@ unsafe extern "system" fn window_proc(
 
                 if (ctrl_down && shift_down && vk == 0x50) || vk == 0x70 {
                     state.command_palette.open();
-                    state.command_palette.refresh_results(Some(&state.app_state));
+                    state
+                        .command_palette
+                        .refresh_results(Some(&state.app_state));
                     state.app_state.status_text = "Command palette".to_string();
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
@@ -1266,11 +1802,47 @@ unsafe extern "system" fn window_proc(
                             state.find_replace.open_replace();
                             state.find_focus = FindFieldFocus::Replacement;
                             refresh_find_results(state);
+                        } else if handled && state.app_state.status_text == "Insert image" {
+                            if let Some(path) = pick_image_file(hwnd) {
+                                match insert_image_from_path(state, &path) {
+                                    Ok(_) => {
+                                        state.app_state.status_text = format!(
+                                            "Inserted image: {}",
+                                            path.file_name()
+                                                .and_then(|v| v.to_str())
+                                                .unwrap_or("image")
+                                        );
+                                    }
+                                    Err(err) => {
+                                        state.app_state.status_text =
+                                            format!("Insert image failed: {err}");
+                                    }
+                                }
+                            } else {
+                                state.app_state.status_text = "Insert image cancelled".to_string();
+                            }
                         }
                     }
                     if handled {
                         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                         return LRESULT(0);
+                    }
+                }
+
+                if ctrl_down
+                    && !shift_down
+                    && vk == 0x56
+                    && !state.find_replace.find_visible
+                    && !state.command_palette.is_open()
+                    && !state.goto_visible
+                {
+                    match insert_image_from_clipboard(state) {
+                        Ok(id) => {
+                            state.app_state.status_text = format!("Pasted image {}", id.0);
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                        Err(_) => {}
                     }
                 }
 
@@ -1344,17 +1916,20 @@ unsafe extern "system" fn window_proc(
                             handled_find = true;
                         }
                         0x09 => {
-                            state.find_focus = match (state.find_focus, state.find_replace.replace_visible) {
-                                (FindFieldFocus::Query, true) => FindFieldFocus::Replacement,
-                                _ => FindFieldFocus::Query,
-                            };
+                            state.find_focus =
+                                match (state.find_focus, state.find_replace.replace_visible) {
+                                    (FindFieldFocus::Query, true) => FindFieldFocus::Replacement,
+                                    _ => FindFieldFocus::Query,
+                                };
                             handled_find = true;
                         }
                         0x08 => {
                             match state.find_focus {
                                 FindFieldFocus::Query => {
                                     remove_last_char(&mut state.find_replace.query);
-                                    state.find_replace.set_query(state.find_replace.query.clone());
+                                    state
+                                        .find_replace
+                                        .set_query(state.find_replace.query.clone());
                                 }
                                 FindFieldFocus::Replacement => {
                                     remove_last_char(&mut state.find_replace.replacement);
@@ -1383,27 +1958,29 @@ unsafe extern "system" fn window_proc(
                     }
 
                     if ctrl_down && shift_down && vk == 0x43 {
-                        state.find_replace.options.case_sensitive = !state.find_replace.options.case_sensitive;
+                        state.find_replace.options.case_sensitive =
+                            !state.find_replace.options.case_sensitive;
                         state.find_replace.invalidate_cache();
                         state.find_replace.pending_live_update = true;
-                        state.find_replace.last_input_at =
-                            Instant::now() - std::time::Duration::from_millis(state.find_replace.debounce_ms);
+                        state.find_replace.last_input_at = Instant::now()
+                            - std::time::Duration::from_millis(state.find_replace.debounce_ms);
                         handled_find = true;
                     }
                     if ctrl_down && shift_down && vk == 0x57 {
-                        state.find_replace.options.whole_word = !state.find_replace.options.whole_word;
+                        state.find_replace.options.whole_word =
+                            !state.find_replace.options.whole_word;
                         state.find_replace.invalidate_cache();
                         state.find_replace.pending_live_update = true;
-                        state.find_replace.last_input_at =
-                            Instant::now() - std::time::Duration::from_millis(state.find_replace.debounce_ms);
+                        state.find_replace.last_input_at = Instant::now()
+                            - std::time::Duration::from_millis(state.find_replace.debounce_ms);
                         handled_find = true;
                     }
                     if ctrl_down && shift_down && vk == 0x52 {
                         state.find_replace.options.regex = !state.find_replace.options.regex;
                         state.find_replace.invalidate_cache();
                         state.find_replace.pending_live_update = true;
-                        state.find_replace.last_input_at =
-                            Instant::now() - std::time::Duration::from_millis(state.find_replace.debounce_ms);
+                        state.find_replace.last_input_at = Instant::now()
+                            - std::time::Duration::from_millis(state.find_replace.debounce_ms);
                         handled_find = true;
                     }
 
@@ -1411,6 +1988,67 @@ unsafe extern "system" fn window_proc(
                         refresh_find_results(state);
                         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                         return LRESULT(0);
+                    }
+                }
+
+                if state.selected_image.is_some() {
+                    if vk == VK_DELETE.0 as u32 {
+                        if delete_selected_image(state) {
+                            state.app_state.status_text = "Image deleted".to_string();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                    }
+
+                    if ctrl_down && !shift_down && vk == 0x52 {
+                        if let Some(path) = pick_image_file(hwnd) {
+                            if let Some(selected) = state.selected_image {
+                                if delete_selected_image(state) {
+                                    if let Ok(inserted) = insert_image_from_path(state, &path) {
+                                        state.selected_image = Some(inserted);
+                                        state.image_properties_visible = false;
+                                        state.app_state.status_text = format!(
+                                            "Replaced image {} with {}",
+                                            selected.0,
+                                            path.file_name()
+                                                .and_then(|v| v.to_str())
+                                                .unwrap_or("image")
+                                        );
+                                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                                        return LRESULT(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if ctrl_down && !shift_down && vk == 0x4C {
+                        if align_selected_image(state, ImageAlignment::Left) {
+                            state.app_state.status_text = "Image aligned left".to_string();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                    }
+                    if ctrl_down && !shift_down && vk == 0x45 {
+                        if align_selected_image(state, ImageAlignment::Center) {
+                            state.app_state.status_text = "Image aligned center".to_string();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                    }
+                    if ctrl_down && !shift_down && vk == 0x49 {
+                        if align_selected_image(state, ImageAlignment::Right) {
+                            state.app_state.status_text = "Image aligned right".to_string();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
+                    }
+                    if ctrl_down && shift_down && vk == 0x42 {
+                        if toggle_selected_image_border(state) {
+                            state.app_state.status_text = "Image border toggled".to_string();
+                            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                            return LRESULT(0);
+                        }
                     }
                 }
 
@@ -1622,14 +2260,22 @@ unsafe extern "system" fn window_proc(
                                 .and_then(|v| v.to_str())
                                 .unwrap_or("Document")
                                 .to_string();
+                            let document = load_document_for_path(path.as_path());
                             state
                                 .tabs
-                                .open_document_tab(title, Some(path.clone()), DocumentModel::default());
+                                .open_document_tab(title, Some(path.clone()), document);
                         }
                         format!("Drop to open: {} file(s)", payload.files.len())
                     }
                     DropAction::InsertImage => {
-                        format!("Drop to insert image: {} file(s)", payload.files.len())
+                        let (inserted, failed) = insert_images_from_paths(state, &payload.files);
+                        if inserted == 0 {
+                            format!("Drop image insert failed ({failed} file(s))")
+                        } else if failed == 0 {
+                            format!("Inserted {} dropped image(s)", inserted)
+                        } else {
+                            format!("Inserted {} dropped image(s), {} failed", inserted, failed)
+                        }
                     }
                     DropAction::Ignore => "Unsupported dropped content".to_string(),
                 };
@@ -1643,7 +2289,8 @@ unsafe extern "system" fn window_proc(
             if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
                 let point = point_from_lparam(lparam);
                 if state.sidebar_resizing {
-                    let next_width = (point.x + state.sidebar_resize_grab_offset).clamp(200.0, 400.0);
+                    let next_width =
+                        (point.x + state.sidebar_resize_grab_offset).clamp(200.0, 400.0);
                     if (state.app_state.sidebar_width - next_width).abs() > f32::EPSILON {
                         state.app_state.sidebar_width = next_width;
                         state.app_state.status_text = format!("Sidebar width: {:.0}px", next_width);
@@ -1657,6 +2304,13 @@ unsafe extern "system" fn window_proc(
                     }
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
+                }
+                if state.image_drag.is_some() {
+                    let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                    if update_image_drag(state, point, shift_down) {
+                        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                        return LRESULT(0);
+                    }
                 }
                 let event = UiInputEvent::MouseMove(point);
                 let mut dirty = false;
@@ -1714,12 +2368,73 @@ unsafe extern "system" fn window_proc(
                 if state.app_state.show_toolbar {
                     if let Some(index) = state.toolbar.hit_button(point) {
                         if let Some(action) = state.toolbar.invoke(index) {
-                            if action == ToolbarAction::CommandPalette {
-                                state.command_palette.open();
-                                state.command_palette.refresh_results(Some(&state.app_state));
+                            match action {
+                                ToolbarAction::CommandPalette => {
+                                    state.command_palette.open();
+                                    state
+                                        .command_palette
+                                        .refresh_results(Some(&state.app_state));
+                                    state.app_state.status_text = "Command palette".to_string();
+                                }
+                                ToolbarAction::InsertImage => {
+                                    if let Some(path) = pick_image_file(hwnd) {
+                                        match insert_image_from_path(state, &path) {
+                                            Ok(id) => {
+                                                state.app_state.status_text = format!(
+                                                    "Inserted image {} ({})",
+                                                    id.0,
+                                                    path.file_name()
+                                                        .and_then(|v| v.to_str())
+                                                        .unwrap_or("image")
+                                                );
+                                            }
+                                            Err(err) => {
+                                                state.app_state.status_text =
+                                                    format!("Insert image failed: {err}");
+                                            }
+                                        }
+                                    } else {
+                                        state.app_state.status_text =
+                                            "Insert image cancelled".to_string();
+                                    }
+                                }
+                                ToolbarAction::Paste => {
+                                    if let Ok(id) = insert_image_from_clipboard(state) {
+                                        state.app_state.status_text =
+                                            format!("Pasted image {}", id.0);
+                                    } else {
+                                        state.app_state.status_text = "Paste".to_string();
+                                    }
+                                }
+                                ToolbarAction::AlignLeft => {
+                                    if align_selected_image(state, ImageAlignment::Left) {
+                                        state.app_state.status_text =
+                                            "Image aligned left".to_string();
+                                    } else {
+                                        state.app_state.status_text = "Align left".to_string();
+                                    }
+                                }
+                                ToolbarAction::AlignCenter => {
+                                    if align_selected_image(state, ImageAlignment::Center) {
+                                        state.app_state.status_text =
+                                            "Image aligned center".to_string();
+                                    } else {
+                                        state.app_state.status_text = "Align center".to_string();
+                                    }
+                                }
+                                ToolbarAction::AlignRight => {
+                                    if align_selected_image(state, ImageAlignment::Right) {
+                                        state.app_state.status_text =
+                                            "Image aligned right".to_string();
+                                    } else {
+                                        state.app_state.status_text = "Align right".to_string();
+                                    }
+                                }
+                                _ => {
+                                    state.app_state.status_text =
+                                        format!("Toolbar action: {}", toolbar_action_text(action));
+                                }
                             }
-                            state.app_state.status_text =
-                                format!("Toolbar action: {}", toolbar_action_text(action));
                         }
                     }
                     handled |= state.toolbar.handle_input(&event);
@@ -1753,6 +2468,10 @@ unsafe extern "system" fn window_proc(
                     }
                 }
 
+                if begin_image_interaction(state, point) {
+                    handled = true;
+                }
+
                 if handled {
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
@@ -1766,8 +2485,40 @@ unsafe extern "system" fn window_proc(
                     state.sidebar_resizing = false;
                     state.sidebar.resizing = false;
                     let _ = unsafe { ReleaseCapture() };
-                    state.app_state.status_text =
-                        format!("Sidebar width set to {:.0}px", state.app_state.sidebar_width);
+                    state.app_state.status_text = format!(
+                        "Sidebar width set to {:.0}px",
+                        state.app_state.sidebar_width
+                    );
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+                if state.image_drag.take().is_some() {
+                    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                    return LRESULT(0);
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+        WM_LBUTTONDBLCLK => {
+            if let Some(state) = unsafe { state_from_hwnd(hwnd) } {
+                let point = point_from_lparam(lparam);
+                if begin_image_interaction(state, point) {
+                    state.image_properties_visible = true;
+                    if let Some(selected) = state.selected_image {
+                        if let Some(image) = active_image_ref(state, selected) {
+                            state.app_state.status_text = format!(
+                                "Image properties: {:.0}x{:.0}, {:?}, alt='{}'",
+                                image.width,
+                                image.height,
+                                image.alignment,
+                                if image.alt_text.is_empty() {
+                                    "(empty)"
+                                } else {
+                                    image.alt_text.as_str()
+                                }
+                            );
+                        }
+                    }
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
                 }
@@ -1791,4 +2542,3 @@ unsafe extern "system" fn window_proc(
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }
-

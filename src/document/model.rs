@@ -3,10 +3,7 @@ use std::{collections::HashMap, path::PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    document::DocumentFormat,
-    ui::Color,
-};
+use crate::{document::DocumentFormat, ui::Color};
 
 pub type DocumentModel = Document;
 
@@ -183,7 +180,10 @@ pub enum PageSize {
     Letter,
     A4,
     Legal,
-    Custom { width_points: f32, height_points: f32 },
+    Custom {
+        width_points: f32,
+        height_points: f32,
+    },
 }
 
 impl Default for PageSize {
@@ -359,6 +359,103 @@ impl Default for ListType {
 }
 
 impl Document {
+    pub fn next_block_id(&self) -> BlockId {
+        fn walk(block: &Block, max: &mut u64) {
+            match block {
+                Block::Paragraph(p) => *max = (*max).max(p.id.0),
+                Block::Heading(h) => *max = (*max).max(h.id.0),
+                Block::CodeBlock(c) => *max = (*max).max(c.id.0),
+                Block::Image(i) => *max = (*max).max(i.id.0),
+                Block::Table(t) => {
+                    *max = (*max).max(t.id.0);
+                    for row in &t.rows {
+                        for cell in &row.cells {
+                            for nested in &cell.blocks {
+                                walk(nested, max);
+                            }
+                        }
+                    }
+                }
+                Block::List(list) => {
+                    for item in &list.items {
+                        *max = (*max).max(item.id.0);
+                        for nested in &item.content {
+                            walk(nested, max);
+                        }
+                        for child in &item.children {
+                            *max = (*max).max(child.id.0);
+                            for nested in &child.content {
+                                walk(nested, max);
+                            }
+                        }
+                    }
+                }
+                Block::BlockQuote(q) => {
+                    *max = (*max).max(q.id.0);
+                    for nested in &q.blocks {
+                        walk(nested, max);
+                    }
+                }
+                Block::PageBreak | Block::HorizontalRule => {}
+            }
+        }
+
+        let mut max = 0;
+        for block in &self.content {
+            walk(block, &mut max);
+        }
+        BlockId(max + 1)
+    }
+
+    pub fn insert_embedded_image_after(
+        &mut self,
+        after_block_id: Option<BlockId>,
+        bytes: Vec<u8>,
+        mime: String,
+        width: u32,
+        height: u32,
+        source_path: Option<PathBuf>,
+        alt_text: String,
+    ) -> BlockId {
+        let block_id = self.next_block_id();
+        let key = format!("image-{}", block_id.0);
+        let image_data = ImageData {
+            bytes,
+            mime,
+            width,
+            height,
+        };
+        self.images.insert(key.clone(), image_data.clone());
+
+        let image_block = Block::Image(ImageBlock {
+            id: block_id,
+            data: ImageDataRef::Embedded(image_data),
+            original_width: width,
+            original_height: height,
+            width: width as f32,
+            height: height as f32,
+            alignment: ImageAlignment::Inline,
+            caption: None,
+            alt_text,
+            border: None,
+            crop: None,
+            key,
+            source_path,
+        });
+
+        let insert_index = after_block_id
+            .and_then(|target| {
+                self.content
+                    .iter()
+                    .position(|block| block_id_for_block(block) == Some(target))
+                    .map(|idx| idx + 1)
+            })
+            .unwrap_or(self.content.len());
+        self.content.insert(insert_index, image_block);
+        self.dirty = true;
+        block_id
+    }
+
     pub fn insert_embedded_image(
         &mut self,
         block_id: BlockId,
@@ -375,7 +472,6 @@ impl Document {
             height,
         };
         self.images.insert(key.clone(), image_data.clone());
-
         self.content.push(Block::Image(ImageBlock {
             id: block_id,
             data: ImageDataRef::Embedded(image_data),
@@ -392,5 +488,156 @@ impl Document {
             source_path: None,
         }));
         self.dirty = true;
+    }
+
+    pub fn find_image_block_mut(&mut self, block_id: BlockId) -> Option<&mut ImageBlock> {
+        fn walk(block: &mut Block, block_id: BlockId) -> Option<&mut ImageBlock> {
+            match block {
+                Block::Image(image) if image.id == block_id => Some(image),
+                Block::Table(table) => {
+                    for row in &mut table.rows {
+                        for cell in &mut row.cells {
+                            for nested in &mut cell.blocks {
+                                if let Some(image) = walk(nested, block_id) {
+                                    return Some(image);
+                                }
+                            }
+                        }
+                    }
+                    None
+                }
+                Block::List(list) => {
+                    for item in &mut list.items {
+                        for nested in &mut item.content {
+                            if let Some(image) = walk(nested, block_id) {
+                                return Some(image);
+                            }
+                        }
+                        for child in &mut item.children {
+                            for nested in &mut child.content {
+                                if let Some(image) = walk(nested, block_id) {
+                                    return Some(image);
+                                }
+                            }
+                        }
+                    }
+                    None
+                }
+                Block::BlockQuote(q) => {
+                    for nested in &mut q.blocks {
+                        if let Some(image) = walk(nested, block_id) {
+                            return Some(image);
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+
+        for block in &mut self.content {
+            if let Some(image) = walk(block, block_id) {
+                return Some(image);
+            }
+        }
+        None
+    }
+
+    pub fn remove_image_block(&mut self, block_id: BlockId) -> bool {
+        let mut removed = false;
+        let mut removed_key = None;
+        self.content.retain(|block| {
+            let keep = match block {
+                Block::Image(image) if image.id == block_id => {
+                    removed_key = Some(image.key.clone());
+                    false
+                }
+                _ => true,
+            };
+            if !keep {
+                removed = true;
+            }
+            keep
+        });
+
+        if let Some(key) = removed_key {
+            self.images.remove(key.as_str());
+        }
+        if removed {
+            self.dirty = true;
+        }
+        removed
+    }
+}
+
+fn block_id_for_block(block: &Block) -> Option<BlockId> {
+    match block {
+        Block::Paragraph(p) => Some(p.id),
+        Block::Heading(h) => Some(h.id),
+        Block::CodeBlock(c) => Some(c.id),
+        Block::Table(t) => Some(t.id),
+        Block::Image(i) => Some(i.id),
+        Block::BlockQuote(q) => Some(q.id),
+        Block::List(list) => list.items.first().map(|item| item.id),
+        Block::PageBreak | Block::HorizontalRule => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paragraph(id: u64, text: &str) -> Block {
+        Block::Paragraph(Paragraph {
+            id: BlockId(id),
+            runs: vec![Run {
+                text: text.to_string(),
+                style: RunStyle::default(),
+            }],
+            alignment: ParagraphAlignment::Left,
+            spacing: ParagraphSpacing::default(),
+            indent: Indent::default(),
+            style_id: None,
+        })
+    }
+
+    #[test]
+    fn insert_embedded_image_after_cursor_block() {
+        let mut doc = Document::default();
+        doc.content.push(paragraph(1, "A"));
+        doc.content.push(paragraph(2, "B"));
+
+        let inserted = doc.insert_embedded_image_after(
+            Some(BlockId(1)),
+            vec![1, 2, 3],
+            "image/png".to_string(),
+            100,
+            60,
+            None,
+            "alt".to_string(),
+        );
+
+        assert_eq!(inserted, BlockId(3));
+        assert!(matches!(doc.content[1], Block::Image(_)));
+        assert_eq!(doc.images.len(), 1);
+        assert!(doc.dirty);
+    }
+
+    #[test]
+    fn remove_image_block_cleans_document_and_map() {
+        let mut doc = Document::default();
+        let inserted = doc.insert_embedded_image_after(
+            None,
+            vec![9, 8, 7],
+            "image/png".to_string(),
+            32,
+            32,
+            None,
+            String::new(),
+        );
+
+        assert!(doc.remove_image_block(inserted));
+        assert!(doc.images.is_empty());
+        assert!(doc.content.iter().all(|b| !matches!(b, Block::Image(_))));
     }
 }

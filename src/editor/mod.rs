@@ -1,21 +1,9 @@
 use std::time::Instant;
 
 use crate::{
-    document::model::{
-        Block,
-        DocumentModel,
-        Paragraph,
-        ParagraphAlignment,
-        Run,
-        RunStyle,
-    },
+    document::model::{Block, DocumentModel, Paragraph, ParagraphAlignment, Run, RunStyle},
     editor::{
-        commands::{
-            EditCommand,
-            ParagraphFormatOp,
-            RunStylePatch,
-            Shortcut,
-        },
+        commands::{EditCommand, ParagraphFormatOp, RunStylePatch, Shortcut},
         cursor::CursorState,
         undo::{UndoEntry, UndoStack},
     },
@@ -24,6 +12,7 @@ use crate::{
 pub mod clipboard;
 pub mod commands;
 pub mod cursor;
+pub mod image_ops;
 pub mod search;
 pub mod table;
 pub mod undo;
@@ -68,7 +57,9 @@ impl EditEngine {
             Shortcut::Bold => self.pending_format.bold = !self.pending_format.bold,
             Shortcut::Italic => self.pending_format.italic = !self.pending_format.italic,
             Shortcut::Underline => self.pending_format.underline = !self.pending_format.underline,
-            Shortcut::Strikethrough => self.pending_format.strikethrough = !self.pending_format.strikethrough,
+            Shortcut::Strikethrough => {
+                self.pending_format.strikethrough = !self.pending_format.strikethrough
+            }
             Shortcut::Superscript => {
                 self.pending_format.superscript = !self.pending_format.superscript;
                 if self.pending_format.superscript {
@@ -258,7 +249,10 @@ fn apply_to_document(doc: &mut DocumentModel, command: &EditCommand) -> Option<E
                 runs: old,
             })
         }
-        EditCommand::ReplaceParagraph { block_id, paragraph } => {
+        EditCommand::ReplaceParagraph {
+            block_id,
+            paragraph,
+        } => {
             let current = find_paragraph_mut(doc, *block_id)?;
             let old = current.clone();
             *current = paragraph.clone();
@@ -321,9 +315,15 @@ fn apply_to_document(doc: &mut DocumentModel, command: &EditCommand) -> Option<E
                 }
                 ParagraphFormatOp::ListType(list_type) => {
                     paragraph.style_id = match list_type {
-                        Some(crate::document::model::ListType::Bullet) => Some("ListBullet".to_string()),
-                        Some(crate::document::model::ListType::Numbered) => Some("ListNumber".to_string()),
-                        Some(crate::document::model::ListType::Checkbox) => Some("ListCheckbox".to_string()),
+                        Some(crate::document::model::ListType::Bullet) => {
+                            Some("ListBullet".to_string())
+                        }
+                        Some(crate::document::model::ListType::Numbered) => {
+                            Some("ListNumber".to_string())
+                        }
+                        Some(crate::document::model::ListType::Checkbox) => {
+                            Some("ListCheckbox".to_string())
+                        }
                         None => None,
                     }
                 }
@@ -336,7 +336,11 @@ fn apply_to_document(doc: &mut DocumentModel, command: &EditCommand) -> Option<E
                     paragraph.spacing.after = *after;
                 }
                 ParagraphFormatOp::BlockQuoteToggle => {
-                    paragraph.indent.left = if paragraph.indent.left < 18.0 { 24.0 } else { 0.0 };
+                    paragraph.indent.left = if paragraph.indent.left < 18.0 {
+                        24.0
+                    } else {
+                        0.0
+                    };
                 }
             }
 
@@ -427,13 +431,7 @@ fn split_runs_at(runs: &mut Vec<Run>, offset: usize) -> usize {
             let tail = runs[i].text[cut..].to_string();
             let style = runs[i].style.clone();
             runs[i].text.truncate(cut);
-            runs.insert(
-                i + 1,
-                Run {
-                    text: tail,
-                    style,
-                },
-            );
+            runs.insert(i + 1, Run { text: tail, style });
             return i + 1;
         }
         acc = end;
@@ -486,8 +484,13 @@ fn find_paragraph_mut(
     })
 }
 
-fn find_block_index_by_id(doc: &DocumentModel, block_id: crate::document::model::BlockId) -> Option<usize> {
-    doc.content.iter().position(|block| block_id_of(block) == Some(block_id))
+fn find_block_index_by_id(
+    doc: &DocumentModel,
+    block_id: crate::document::model::BlockId,
+) -> Option<usize> {
+    doc.content
+        .iter()
+        .position(|block| block_id_of(block) == Some(block_id))
 }
 
 fn block_id_of(block: &Block) -> Option<crate::document::model::BlockId> {
@@ -538,7 +541,12 @@ fn estimate_command_size(cmd: &EditCommand) -> usize {
             _ => 128,
         },
         EditCommand::ReplaceParagraph { paragraph, .. } => {
-            paragraph.runs.iter().map(|r| r.text.len() + 32).sum::<usize>() + 64
+            paragraph
+                .runs
+                .iter()
+                .map(|r| r.text.len() + 32)
+                .sum::<usize>()
+                + 64
         }
         _ => 24,
     }

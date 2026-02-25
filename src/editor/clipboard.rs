@@ -1,11 +1,7 @@
-
-use std::{
-    mem::size_of,
-    ptr::copy_nonoverlapping,
-    sync::OnceLock,
-};
+use std::{mem::size_of, ptr::copy_nonoverlapping, sync::OnceLock};
 
 use encoding_rs::WINDOWS_1252;
+use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 use windows::{
     Win32::{
@@ -15,18 +11,16 @@ use windows::{
                 CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
                 OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
             },
-            Memory::{
-                GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
-            },
+            Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         },
     },
-    core::{w, Error, Result},
+    core::{Error, Result, w},
 };
 
 use crate::{
     document::{
-        model::{Run, RunStyle},
         DocumentFormat,
+        model::{Run, RunStyle},
     },
     editor::{
         commands::EditCommand,
@@ -35,10 +29,12 @@ use crate::{
 };
 
 const CF_UNICODETEXT_U32: u32 = 13;
+const CF_DIB_U32: u32 = 8;
 
 static INTERNAL_CLIPBOARD_FORMAT: OnceLock<u32> = OnceLock::new();
 static RTF_CLIPBOARD_FORMAT: OnceLock<u32> = OnceLock::new();
 static HTML_CLIPBOARD_FORMAT: OnceLock<u32> = OnceLock::new();
+static PNG_CLIPBOARD_FORMAT: OnceLock<u32> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasteMode {
@@ -64,6 +60,14 @@ impl ClipboardPastePayload {
     pub fn plain_text(&self) -> String {
         runs_to_plain_text(&self.runs)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClipboardImageData {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +231,26 @@ pub fn read_clipboard_for_paste(mode: PasteMode) -> Result<Option<ClipboardPaste
     Ok(None)
 }
 
+pub fn read_clipboard_image() -> Result<Option<ClipboardImageData>> {
+    let _guard = ClipboardGuard::open()?;
+
+    if let Some(bytes) = get_clipboard_bytes(png_clipboard_format())? {
+        if let Some(decoded) = decode_clipboard_image(bytes, "image/png") {
+            return Ok(Some(decoded));
+        }
+    }
+
+    if let Some(dib_bytes) = get_clipboard_bytes(CF_DIB_U32)? {
+        if let Some(bmp_bytes) = dib_to_bmp_bytes(dib_bytes.as_slice()) {
+            if let Some(decoded) = decode_clipboard_image(bmp_bytes, "image/bmp") {
+                return Ok(Some(decoded));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 pub fn drag_drop_commands(
     selection: SelectionRange,
     drop_at: CursorPosition,
@@ -252,7 +276,10 @@ pub fn drag_drop_commands(
         return Vec::new();
     }
 
-    let removed_len = normalized.end.offset.saturating_sub(normalized.start.offset);
+    let removed_len = normalized
+        .end
+        .offset
+        .saturating_sub(normalized.start.offset);
     let insert_offset = if !copy_mode
         && same_source_block
         && same_drop_block
@@ -421,15 +448,80 @@ fn is_format_available(format: u32) -> bool {
 }
 
 fn internal_clipboard_format() -> u32 {
-    *INTERNAL_CLIPBOARD_FORMAT.get_or_init(|| unsafe { RegisterClipboardFormatW(w!("Doco.InternalRuns")) })
+    *INTERNAL_CLIPBOARD_FORMAT
+        .get_or_init(|| unsafe { RegisterClipboardFormatW(w!("Doco.InternalRuns")) })
 }
 
 fn rtf_clipboard_format() -> u32 {
-    *RTF_CLIPBOARD_FORMAT.get_or_init(|| unsafe { RegisterClipboardFormatW(w!("Rich Text Format")) })
+    *RTF_CLIPBOARD_FORMAT
+        .get_or_init(|| unsafe { RegisterClipboardFormatW(w!("Rich Text Format")) })
 }
 
 fn html_clipboard_format() -> u32 {
     *HTML_CLIPBOARD_FORMAT.get_or_init(|| unsafe { RegisterClipboardFormatW(w!("HTML Format")) })
+}
+
+fn png_clipboard_format() -> u32 {
+    *PNG_CLIPBOARD_FORMAT.get_or_init(|| unsafe { RegisterClipboardFormatW(w!("PNG")) })
+}
+
+fn decode_clipboard_image(bytes: Vec<u8>, mime: &str) -> Option<ClipboardImageData> {
+    let decoded = image::load_from_memory(bytes.as_slice()).ok()?;
+    let (width, height) = decoded.dimensions();
+    Some(ClipboardImageData {
+        bytes,
+        mime: mime.to_string(),
+        width,
+        height,
+    })
+}
+
+fn dib_to_bmp_bytes(dib: &[u8]) -> Option<Vec<u8>> {
+    if dib.len() < 40 {
+        return None;
+    }
+
+    let header_size = u32::from_le_bytes(dib[0..4].try_into().ok()?) as usize;
+    if header_size < 40 || dib.len() < header_size {
+        return None;
+    }
+
+    let bpp = u16::from_le_bytes(dib[14..16].try_into().ok()?);
+    let compression = u32::from_le_bytes(dib[16..20].try_into().ok()?);
+    let colors_used = u32::from_le_bytes(dib[32..36].try_into().ok()?);
+    let masks_len = if compression == 3 && header_size == 40 {
+        12usize
+    } else {
+        0usize
+    };
+    let palette_entries = if bpp <= 8 {
+        if colors_used == 0 {
+            1u32.checked_shl(bpp as u32).unwrap_or(0)
+        } else {
+            colors_used
+        }
+    } else {
+        0
+    };
+    let palette_len = palette_entries as usize * 4;
+    let pixel_offset_in_dib = header_size
+        .checked_add(masks_len)?
+        .checked_add(palette_len)?;
+    if pixel_offset_in_dib > dib.len() {
+        return None;
+    }
+
+    let file_header_len = 14usize;
+    let file_size = file_header_len.checked_add(dib.len())?;
+    let pixel_offset_in_file = file_header_len.checked_add(pixel_offset_in_dib)?;
+    let mut bmp = Vec::with_capacity(file_size);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
+    bmp.extend_from_slice(&0u16.to_le_bytes());
+    bmp.extend_from_slice(&0u16.to_le_bytes());
+    bmp.extend_from_slice(&(pixel_offset_in_file as u32).to_le_bytes());
+    bmp.extend_from_slice(dib);
+    Some(bmp)
 }
 
 fn should_emit_rich_formats(runs: &[Run], source_format: DocumentFormat) -> bool {
@@ -512,7 +604,11 @@ fn emit_rtf_style_delta(out: &mut String, prev: &RunStyle, next: &RunStyle) {
         out.push_str(if next.underline { "\\ul " } else { "\\ul0 " });
     }
     if prev.strikethrough != next.strikethrough {
-        out.push_str(if next.strikethrough { "\\strike " } else { "\\strike0 " });
+        out.push_str(if next.strikethrough {
+            "\\strike "
+        } else {
+            "\\strike0 "
+        });
     }
 
     if next.superscript {
@@ -559,13 +655,21 @@ fn parse_rtf_to_runs(rtf: &str) -> Vec<Run> {
     while i < bytes.len() {
         match bytes[i] {
             b'{' => {
-                flush_run(&mut runs, &mut text, style_stack.last().expect("style stack"));
+                flush_run(
+                    &mut runs,
+                    &mut text,
+                    style_stack.last().expect("style stack"),
+                );
                 style_stack.push(style_stack.last().expect("style stack").clone());
                 skip_stack.push(*skip_stack.last().unwrap_or(&false));
                 i += 1;
             }
             b'}' => {
-                flush_run(&mut runs, &mut text, style_stack.last().expect("style stack"));
+                flush_run(
+                    &mut runs,
+                    &mut text,
+                    style_stack.last().expect("style stack"),
+                );
                 if style_stack.len() > 1 {
                     style_stack.pop();
                 }
@@ -637,13 +741,7 @@ fn parse_rtf_to_runs(rtf: &str) -> Vec<Run> {
                         }
 
                         if !skip_stack.last().copied().unwrap_or(false) {
-                            apply_rtf_control(
-                                &mut runs,
-                                &mut text,
-                                &mut style_stack,
-                                word,
-                                arg,
-                            );
+                            apply_rtf_control(&mut runs, &mut text, &mut style_stack, word, arg);
                         }
 
                         if word == "u" && i < bytes.len() && bytes[i] == b'?' {
@@ -665,7 +763,11 @@ fn parse_rtf_to_runs(rtf: &str) -> Vec<Run> {
         }
     }
 
-    flush_run(&mut runs, &mut text, style_stack.last().expect("style stack"));
+    flush_run(
+        &mut runs,
+        &mut text,
+        style_stack.last().expect("style stack"),
+    );
     runs
 }
 
@@ -760,7 +862,8 @@ fn runs_to_html_fragment(runs: &[Run]) -> String {
 }
 
 fn build_cf_html(fragment: &str) -> String {
-    let html_body = format!("<html><body><!--StartFragment-->{fragment}<!--EndFragment--></body></html>");
+    let html_body =
+        format!("<html><body><!--StartFragment-->{fragment}<!--EndFragment--></body></html>");
     let header_template = "Version:1.0\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\n";
     let start_html = header_template.len();
     let start_fragment = start_html + "<html><body><!--StartFragment-->".len();
@@ -786,7 +889,11 @@ fn parse_html_to_runs(raw_html: &str) -> Vec<Run> {
             if let Some(end_rel) = html[i..].find('>') {
                 let end = i + end_rel;
                 let tag = html[i + 1..end].trim();
-                flush_run(&mut runs, &mut text, style_stack.last().expect("style stack"));
+                flush_run(
+                    &mut runs,
+                    &mut text,
+                    style_stack.last().expect("style stack"),
+                );
                 handle_html_tag(tag, &mut style_stack, &mut text);
                 i = end + 1;
                 continue;
@@ -805,21 +912,18 @@ fn parse_html_to_runs(raw_html: &str) -> Vec<Run> {
         i += ch.len_utf8();
     }
 
-    flush_run(&mut runs, &mut text, style_stack.last().expect("style stack"));
+    flush_run(
+        &mut runs,
+        &mut text,
+        style_stack.last().expect("style stack"),
+    );
     runs
 }
 
 fn is_ignored_rtf_destination(word: &str) -> bool {
     matches!(
         word,
-        "fonttbl"
-            | "colortbl"
-            | "stylesheet"
-            | "info"
-            | "pict"
-            | "object"
-            | "header"
-            | "footer"
+        "fonttbl" | "colortbl" | "stylesheet" | "info" | "pict" | "object" | "header" | "footer"
     )
 }
 
@@ -1048,6 +1152,10 @@ fn flush_run(runs: &mut Vec<Run>, text: &mut String, style: &RunStyle) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use image::{DynamicImage, ImageFormat};
+
     use super::*;
 
     fn plain_run(text: &str) -> Run {
@@ -1189,5 +1297,17 @@ mod tests {
         let runs = vec![plain_run("100000 chars test")];
         assert!(!should_emit_rich_formats(&runs, DocumentFormat::Text));
         assert!(should_emit_rich_formats(&runs, DocumentFormat::Docx));
+    }
+
+    #[test]
+    fn dib_payload_converts_back_to_bmp() {
+        let mut bmp = Vec::new();
+        DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut Cursor::new(&mut bmp), ImageFormat::Bmp)
+            .expect("encode bmp");
+        let dib = bmp[14..].to_vec();
+        let rebuilt = dib_to_bmp_bytes(dib.as_slice()).expect("convert dib");
+        let decoded = image::load_from_memory(rebuilt.as_slice()).expect("decode rebuilt bmp");
+        assert_eq!(decoded.dimensions(), (2, 2));
     }
 }

@@ -4,10 +4,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP, SHARD_PATHW, SHAddToRecentDocs};
+use windows::{
+    Win32::{
+        Foundation::HWND,
+        UI::{
+            Controls::Dialogs::{
+                GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+            },
+            Shell::{DragFinish, DragQueryFileW, HDROP, SHARD_PATHW, SHAddToRecentDocs},
+        },
+    },
+    core::w,
+};
 
 pub const SUPPORTED_DOCUMENT_EXTENSIONS: &[&str] = &["docx", "pdf", "txt", "md", "rtf"];
-pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff"];
+pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "bmp", "gif", "webp", "tif", "tiff", "svg",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropAction {
@@ -156,4 +169,54 @@ pub fn explorer_open_with_command(exe_path: &Path) -> String {
 pub fn send_toast_notification(title: &str, body: &str) {
     // Placeholder implementation: integration point for WinRT toast bridge.
     eprintln!("[toast] {} - {}", title, body);
+}
+
+pub fn pick_image_file(hwnd: HWND) -> Option<PathBuf> {
+    let mut file_buffer = vec![0u16; 260];
+    let mut filter = String::new();
+    filter.push_str("Image Files (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tif;*.tiff;*.svg)\0");
+    filter.push_str("*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tif;*.tiff;*.svg\0");
+    filter.push_str("All Files (*.*)\0*.*\0\0");
+    let filter_wide = filter.encode_utf16().collect::<Vec<u16>>();
+
+    let mut open = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: windows::core::PCWSTR::from_raw(filter_wide.as_ptr()),
+        lpstrFile: windows::core::PWSTR(file_buffer.as_mut_ptr()),
+        nMaxFile: file_buffer.len() as u32,
+        lpstrTitle: w!("Insert Image"),
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+        ..Default::default()
+    };
+
+    let ok = unsafe { GetOpenFileNameW(&mut open).as_bool() };
+    if !ok {
+        return None;
+    }
+
+    let len = file_buffer
+        .iter()
+        .position(|c| *c == 0)
+        .unwrap_or(file_buffer.len());
+    if len == 0 {
+        return None;
+    }
+    let path = OsString::from_wide(&file_buffer[..len]);
+    Some(PathBuf::from(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{DropAction, classify_drop, is_image_path};
+
+    #[test]
+    fn classify_svg_as_image_insert() {
+        let files = vec![PathBuf::from("diagram.svg"), PathBuf::from("photo.png")];
+        let action = classify_drop(files.as_slice());
+        assert_eq!(action, DropAction::InsertImage);
+        assert!(is_image_path(PathBuf::from("icon.svg").as_path()));
+    }
 }
