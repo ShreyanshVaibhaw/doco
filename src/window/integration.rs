@@ -7,10 +7,12 @@ use std::{
 use windows::{
     Win32::{
         Foundation::HWND,
+        Graphics::Gdi::DeleteDC,
         UI::{
             Controls::Dialogs::{
                 GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST,
-                OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+                OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW, PD_NOSELECTION, PD_PAGENUMS,
+                PD_RETURNDC, PD_USEDEVMODECOPIESANDCOLLATE, PRINTDLGW, PrintDlgW,
             },
             Shell::{DragFinish, DragQueryFileW, HDROP, SHARD_PATHW, SHAddToRecentDocs},
         },
@@ -167,9 +169,74 @@ pub fn explorer_open_with_command(exe_path: &Path) -> String {
     format!("\"{}\" \"%1\"", exe_path.display())
 }
 
+pub fn file_association_registry_commands(exe_path: &Path) -> Vec<String> {
+    let mut commands = Vec::new();
+    let open_command = explorer_open_with_command(exe_path);
+    for ext in file_association_extensions() {
+        let prog_id = format!("Doco.{}", ext.to_ascii_uppercase());
+        commands.push(format!(
+            "reg add HKCU\\Software\\Classes\\.{ext} /ve /d {prog_id} /f"
+        ));
+        commands.push(format!(
+            "reg add HKCU\\Software\\Classes\\{prog_id}\\shell\\open\\command /ve /d \"{open_command}\" /f"
+        ));
+    }
+    commands
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrintDialogResult {
+    pub page_range: Option<(u32, u32)>,
+    pub copies: u16,
+}
+
+pub fn open_print_dialog(hwnd: HWND) -> Option<PrintDialogResult> {
+    let mut dialog = PRINTDLGW {
+        lStructSize: std::mem::size_of::<PRINTDLGW>() as u32,
+        hwndOwner: hwnd,
+        Flags: PD_RETURNDC | PD_USEDEVMODECOPIESANDCOLLATE | PD_NOSELECTION,
+        nMinPage: 1,
+        nMaxPage: u16::MAX,
+        nFromPage: 1,
+        nToPage: 1,
+        ..Default::default()
+    };
+
+    let ok = unsafe { PrintDlgW(&mut dialog).as_bool() };
+    if !ok {
+        return None;
+    }
+
+    let page_range = if dialog.Flags.0 & PD_PAGENUMS.0 != 0 {
+        normalize_page_range(dialog.nFromPage, dialog.nToPage)
+    } else {
+        None
+    };
+
+    if !dialog.hDC.0.is_null() {
+        unsafe {
+            let _ = DeleteDC(dialog.hDC);
+        }
+    }
+
+    Some(PrintDialogResult {
+        page_range,
+        copies: dialog.nCopies.max(1),
+    })
+}
+
 pub fn send_toast_notification(title: &str, body: &str) {
     // Placeholder implementation: integration point for WinRT toast bridge.
     eprintln!("[toast] {} - {}", title, body);
+}
+
+fn normalize_page_range(from: u16, to: u16) -> Option<(u32, u32)> {
+    if from == 0 && to == 0 {
+        return None;
+    }
+    let start = from.max(1) as u32;
+    let end = to.max(from).max(1) as u32;
+    Some((start, end))
 }
 
 pub fn pick_image_file(hwnd: HWND) -> Option<PathBuf> {
@@ -270,7 +337,13 @@ pub fn pick_save_file(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{DropAction, classify_drop, is_image_path};
+    use super::{
+        DropAction,
+        classify_drop,
+        file_association_registry_commands,
+        is_image_path,
+        normalize_page_range,
+    };
 
     #[test]
     fn classify_svg_as_image_insert() {
@@ -278,5 +351,20 @@ mod tests {
         let action = classify_drop(files.as_slice());
         assert_eq!(action, DropAction::InsertImage);
         assert!(is_image_path(PathBuf::from("icon.svg").as_path()));
+    }
+
+    #[test]
+    fn file_association_commands_cover_core_extensions() {
+        let commands = file_association_registry_commands(PathBuf::from("C:\\Apps\\doco.exe").as_path());
+        assert!(commands.iter().any(|line| line.contains(".docx")));
+        assert!(commands.iter().any(|line| line.contains(".pdf")));
+        assert!(commands.iter().any(|line| line.contains("%1")));
+    }
+
+    #[test]
+    fn normalize_range_orders_bounds() {
+        assert_eq!(normalize_page_range(0, 0), None);
+        assert_eq!(normalize_page_range(3, 1), Some((3, 3)));
+        assert_eq!(normalize_page_range(2, 6), Some((2, 6)));
     }
 }

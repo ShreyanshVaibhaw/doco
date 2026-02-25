@@ -97,7 +97,7 @@ use crate::{
     },
     window::integration::{
         DropAction, JumpListState, PrintState, extract_drop_payload, parse_startup_files_from_cli,
-        pick_image_file, pick_save_file,
+        pick_image_file, pick_save_file, open_print_dialog, send_toast_notification,
     },
 };
 
@@ -683,6 +683,10 @@ fn export_active_document(state: &mut WindowState, hwnd: HWND, ext: &str) -> boo
     match result {
         Ok(_) => {
             state.app_state.status_text = format!("Exported {}", path.display());
+            send_toast_notification(
+                "Export complete",
+                format!("{}", path.display()).as_str(),
+            );
         }
         Err(err) => {
             state.app_state.status_text = format!("Export failed: {err}");
@@ -3182,6 +3186,10 @@ unsafe extern "system" fn window_proc(
                     if let Ok(Some(path)) = state.app_state.autosave.tick(&tab.document) {
                         state.app_state.status_text =
                             format!("Auto-saved recovery snapshot: {}", path.display());
+                        send_toast_notification(
+                            "Auto-recovery saved",
+                            format!("{}", path.display()).as_str(),
+                        );
                     }
                 }
                 if state.find_replace.should_live_update(now) {
@@ -3733,7 +3741,19 @@ unsafe extern "system" fn window_proc(
 
                 if ctrl_down && !shift_down && vk == 0x50 {
                     state.print_state.request_print_dialog();
-                    state.app_state.status_text = "Print dialog requested".to_string();
+                    if let Some(result) = open_print_dialog(hwnd) {
+                        state.print_state.page_range = result.page_range;
+                        state.print_state.include_header_footer = true;
+                        state.print_state.complete_print();
+                        state.app_state.status_text = if let Some((from, to)) = result.page_range {
+                            format!("Print queued (pages {from}-{to}, copies {})", result.copies)
+                        } else {
+                            format!("Print queued (all pages, copies {})", result.copies)
+                        };
+                    } else {
+                        state.print_state.complete_print();
+                        state.app_state.status_text = "Print cancelled".to_string();
+                    }
                     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     return LRESULT(0);
                 }
